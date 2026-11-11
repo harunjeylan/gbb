@@ -52,6 +52,56 @@ fn snapshot_min_secs() -> u64 {
     crate::env_u64("GBB_SNAPSHOT_MIN_SECS", 300)
 }
 
+/// A snapshot holds the build-dir lock, so its cost is a wait imposed on every
+/// other command in that directory. This is the cap on that wait.
+fn snapshot_max_secs() -> u64 {
+    crate::env_u64("GBB_SNAPSHOT_MAX_SECS", 60)
+}
+
+/// Copy throughput in MB/s: learned from the last snapshot, overridable.
+fn copy_mbps() -> u64 {
+    fs::read_to_string(jobs::cache_dir().join("copy_mbps"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .filter(|n| *n > 1)
+        .unwrap_or_else(|| crate::env_u64("GBB_COPY_MBPS", 40))
+}
+
+fn record_copy_mbps(bytes: u64, secs: u64) {
+    if secs == 0 || bytes < 1024 * 1024 {
+        return;
+    }
+    let mbps = (bytes / (1024 * 1024)).max(1) / secs;
+    let _ = fs::write(jobs::cache_dir().join("copy_mbps"), mbps.to_string());
+}
+
+fn estimated_copy_secs(bytes: u64) -> u64 {
+    bytes / (copy_mbps().max(1) * 1024 * 1024)
+}
+
+fn dir_size(root: &Path) -> u64 {
+    let mut total = 0;
+    let Ok(entries) = fs::read_dir(root) else {
+        return 0;
+    };
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if SKIP_DIRS.contains(&name.as_ref()) || name.starts_with(".gbb") {
+                continue;
+            }
+            total += dir_size(&entry.path());
+        } else if file_type.is_file() {
+            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    total
+}
+
 /// Identity of the repository, stable across worktrees: the git common dir.
 pub fn workspace_key(root: &Path) -> String {
     let common = Command::new("git")
@@ -286,10 +336,24 @@ pub fn store(
         }
     }
 
+    // The copy holds the build-dir lock, so a slow disk turns a snapshot into the
+    // very wait gbb exists to remove. Refuse the snapshot instead.
+    let size = dir_size(build_dir);
+    let estimate = estimated_copy_secs(size);
+    if estimate > snapshot_max_secs() {
+        eprintln!(
+            "gbb: cache snapshot skipped ({} GB would hold the build dir ~{}s)",
+            size / (1024 * 1024 * 1024),
+            estimate
+        );
+        return Ok(None);
+    }
+
     let staging = targets_root(workspace, profile).join(format!(".staging-{}", std::process::id()));
     let _ = fs::remove_dir_all(&staging);
     fs::create_dir_all(&staging)?;
 
+    let copy_started = std::time::Instant::now();
     let copied = copy_tree(
         build_dir,
         &staging.join("target"),
@@ -297,6 +361,7 @@ pub fn store(
     );
     match copied {
         Ok(bytes) => {
+            record_copy_mbps(bytes, copy_started.elapsed().as_secs());
             let manifest = manifest(&staging.join("target"));
             let meta = format!(
                 "digest={digest}\ncreated={}\nbytes={bytes}\nmanifest={manifest}\n",
@@ -305,6 +370,12 @@ pub fn store(
             fs::write(meta_path(&staging), meta)?;
             if let Err(e) = fs::rename(&staging, &destination) {
                 let _ = fs::remove_dir_all(&staging);
+                // Another worker may have published this exact digest between
+                // the check above and the rename. Losing that race is success.
+                let benign = matches!(e.raw_os_error(), Some(17) | Some(39));
+                if benign {
+                    return Ok(Some(destination));
+                }
                 return Err(e);
             }
             prune(cache_gb() * 1024 * 1024 * 1024, true)?;
@@ -403,7 +474,28 @@ fn copy_tree(src: &Path, dst: &Path, max_bytes: usize) -> io::Result<u64> {
             total += len;
         } else if file_type.is_symlink() {
             let target = fs::read_link(entry.path())?;
-            std::os::unix::fs::symlink(target, &to)?;
+            if target.is_absolute() {
+                // Absolute links point into the source checkout. Recreating one
+                // would carry a path from another worktree into this seed.
+                match fs::metadata(entry.path()) {
+                    Ok(meta) if meta.is_file() => {
+                        let len = meta.len();
+                        if total + len > max_bytes as u64 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::FileTooLarge,
+                                "snapshot budget",
+                            ));
+                        }
+                        fs::copy(entry.path(), &to)?;
+                        total += len;
+                    }
+                    // Directory links are skipped rather than followed: following
+                    // them can escape the tree or loop.
+                    _ => continue,
+                }
+            } else {
+                std::os::unix::fs::symlink(target, &to)?;
+            }
         }
     }
     Ok(total)
@@ -556,5 +648,49 @@ mod tests {
         let err = copy_tree(&src, &base.join("dst"), 1024).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::FileTooLarge);
         fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn absolute_symlinks_are_materialised_not_carried_over() {
+        let base = std::env::temp_dir().join(format!("gbb-link-{}", std::process::id()));
+        let src = base.join("src");
+        fs::create_dir_all(&src).unwrap();
+        let payload = base.join("payload.txt");
+        fs::write(&payload, b"from-elsewhere").unwrap();
+        std::os::unix::fs::symlink(&payload, src.join("abs-link")).unwrap();
+        std::os::unix::fs::symlink("payload.txt", src.join("rel-link")).unwrap();
+
+        let dst = base.join("dst");
+        copy_tree(&src, &dst, usize::MAX).unwrap();
+
+        assert!(dst.join("abs-link").is_file());
+        assert_eq!(fs::read(dst.join("abs-link")).unwrap(), b"from-elsewhere");
+        assert!(dst
+            .join("rel-link")
+            .symlink_metadata()
+            .unwrap()
+            .is_symlink());
+
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn dir_size_skips_incremental_and_counts_files() {
+        let base = std::env::temp_dir().join(format!("gbb-size-{}", std::process::id()));
+        let src = base.join("src");
+        fs::create_dir_all(src.join("incremental")).unwrap();
+        fs::write(src.join("incremental").join("chunk"), vec![0u8; 1024]).unwrap();
+        fs::create_dir_all(src.join("deps")).unwrap();
+        fs::write(src.join("deps").join("a.rlib"), vec![0u8; 2048]).unwrap();
+
+        assert_eq!(dir_size(&src), 2048);
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn copy_estimate_grows_with_size() {
+        let small = estimated_copy_secs(64 * 1024 * 1024);
+        let big = estimated_copy_secs(8 * 1024 * 1024 * 1024);
+        assert!(big > small, "{big} should exceed {small}");
     }
 }

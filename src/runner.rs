@@ -136,7 +136,10 @@ fn build_command(args: &[String], class: Class) -> Command {
 
     if class == Class::Heavy {
         // Heavy jobs are the only ones worth colourising; keeps logs readable.
-        cmd.env("CARGO_TERM_COLOR", env::var("CARGO_TERM_COLOR").unwrap_or_else(|_| "always".into()));
+        cmd.env(
+            "CARGO_TERM_COLOR",
+            env::var("CARGO_TERM_COLOR").unwrap_or_else(|_| "always".into()),
+        );
     }
 
     cmd

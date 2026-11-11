@@ -45,7 +45,13 @@ pub struct Job {
 }
 
 impl Job {
-    pub fn started_running(key: &str, pid: u32, class: &str, target: &Path, args: &[String]) -> Job {
+    pub fn started_running(
+        key: &str,
+        pid: u32,
+        class: &str,
+        target: &Path,
+        args: &[String],
+    ) -> Job {
         Job {
             key: key.to_string(),
             state: State::Running,

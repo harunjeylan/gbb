@@ -100,7 +100,10 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<(String, u64, u64)>) -> io::Resul
 }
 
 fn is_build_relevant(path: &Path) -> bool {
-    let name = path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
     if ALWAYS_FILES.contains(&name.as_ref()) {
         return true;
     }

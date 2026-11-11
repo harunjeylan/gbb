@@ -166,7 +166,9 @@ fn run(opts: Opts) -> io::Result<u8> {
     let class = opts
         .class
         .unwrap_or_else(|| classify::classify(&opts.cargo_args));
-    let cmd = classify::subcommand(&opts.cargo_args).unwrap_or("").to_string();
+    let cmd = classify::subcommand(&opts.cargo_args)
+        .unwrap_or("")
+        .to_string();
 
     let join_wait = Duration::from_secs(env_u64("GBB_JOIN_WAIT", 900));
     let lock_wait = if opts.wait > Duration::ZERO {
@@ -223,7 +225,10 @@ fn run(opts: Opts) -> io::Result<u8> {
     };
 
     if let Some(foreign) = foreign_cargo_lock(&resolved.target) {
-        eprintln!("gbb: warning: bare cargo appears to hold {}", foreign.display());
+        eprintln!(
+            "gbb: warning: bare cargo appears to hold {}",
+            foreign.display()
+        );
         eprintln!("gbb:          it will not be serialized against; prefer `gbb <cmd>` everywhere");
     }
 
@@ -315,12 +320,16 @@ fn busy(
     match wait_key {
         Some(wait_key) => {
             println!("GBB_BUSY reason={reason} key={wait_key} slot={class}{eta}");
-            println!("  → do not retry more than 3x, do not run bare cargo, work on something else,");
+            println!(
+                "  → do not retry more than 3x, do not run bare cargo, work on something else,"
+            );
             println!("    then: gbb wait {wait_key}");
         }
         None => {
             println!("GBB_BUSY reason={reason} slot={class}{eta}");
-            println!("  → do not retry more than 3x, do not run bare cargo, work on something else,");
+            println!(
+                "  → do not retry more than 3x, do not run bare cargo, work on something else,"
+            );
             println!("    then retry with: gbb --wait 300 <same cargo command>");
         }
     }
@@ -346,7 +355,11 @@ fn reuse_allowed(cmd: &str, args: &[String]) -> bool {
 
 fn wait_for_job(key: &str, timeout: Duration) -> io::Result<u8> {
     let deadline = Instant::now() + timeout;
-    eprintln!("gbb: waiting for job {} (timeout {}s)", short(key), timeout.as_secs());
+    eprintln!(
+        "gbb: waiting for job {} (timeout {}s)",
+        short(key),
+        timeout.as_secs()
+    );
     loop {
         match jobs::read(key) {
             Some(job) if job.state == jobs::State::Done => {
@@ -360,7 +373,10 @@ fn wait_for_job(key: &str, timeout: Duration) -> io::Result<u8> {
             _ => {}
         }
         if Instant::now() >= deadline {
-            eprintln!("gbb: still running after {}s; giving up without starting a duplicate", timeout.as_secs());
+            eprintln!(
+                "gbb: still running after {}s; giving up without starting a duplicate",
+                timeout.as_secs()
+            );
             return Ok(EXIT_BUSY);
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -374,7 +390,11 @@ fn replay(key: &str) {
     if lines.is_empty() {
         return;
     }
-    eprintln!("gbb: ---- output of job {} (last {} lines) ----", short(key), lines.len());
+    eprintln!(
+        "gbb: ---- output of job {} (last {} lines) ----",
+        short(key),
+        lines.len()
+    );
     for line in lines {
         eprintln!("{line}");
     }
@@ -487,7 +507,11 @@ fn doctor() -> io::Result<u8> {
     let digest = digest::workspace_digest(&resolved.root)?;
     println!("workspace root : {}", resolved.root.display());
     println!("build dir      : {}", resolved.target.display());
-    println!("input digest   : {} ({}ms)", short(&digest), started.elapsed().as_millis());
+    println!(
+        "input digest   : {} ({}ms)",
+        short(&digest),
+        started.elapsed().as_millis()
+    );
     println!("runtime dir    : {}", jobs::runtime_dir().display());
     println!("cache dir      : {}", jobs::cache_dir().display());
     println!(
@@ -498,7 +522,13 @@ fn doctor() -> io::Result<u8> {
         slots::occupancy(Class::Heavy).1
     );
     for bin in ["cargo", "systemd-run", "sccache", "mold", "ld.mold"] {
-        println!("{:<14} : {}", bin, runner::which(bin).map(|p| p.display().to_string()).unwrap_or_else(|| "missing".into()));
+        println!(
+            "{:<14} : {}",
+            bin,
+            runner::which(bin)
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "missing".into())
+        );
     }
     println!("free disk      : {} GB", gc::free_gb());
     Ok(0)
@@ -543,7 +573,9 @@ fn gc_command(argv: &[String]) -> io::Result<u8> {
                 days = argv
                     .get(index)
                     .and_then(|v| v.parse().ok())
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "--days needs a number"))?;
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "--days needs a number")
+                    })?;
             }
             other => {
                 eprintln!("gbb: unknown gc option {other}");
@@ -581,7 +613,10 @@ fn gc_command(argv: &[String]) -> io::Result<u8> {
     }
 
     if !apply {
-        println!("\nreclaimable now: {} GB (dry run — add --apply to delete)", reclaimable / 1024);
+        println!(
+            "\nreclaimable now: {} GB (dry run — add --apply to delete)",
+            reclaimable / 1024
+        );
         if free < 250 {
             println!("warning: free disk below the 250 GB floor");
         }

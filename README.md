@@ -28,11 +28,13 @@ that produces two distinct failures:
 ## Install
 
 ```sh
-cargo build --release
+cargo install --path .            # or: cargo install gbb (once published)
 install -m755 target/release/gbb ~/.local/bin/gbb
 ```
 
-Zero dependencies; uses `std::fs::File::try_lock` (Rust ≥ 1.89) for locking.
+Requirements: Linux, Rust ≥ 1.89 (uses stable `std::fs::File::try_lock`).
+Zero dependencies. `systemd-run` and `sccache` are optional; both are detected at
+runtime and their absence only removes isolation/caching, never correctness.
 
 ## Usage
 
@@ -113,3 +115,14 @@ Nothing off-the-shelf does this; the survey that led here is worth keeping.
 `sccache` is the only layer that reduces *total* work rather than rearranging it, so
 `gbb` injects it when present (`RUSTC_WRAPPER=sccache`, `CARGO_INCREMENTAL=0`, since
 sccache refuses incremental builds and cannot cache bins, dylibs, or proc-macros).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+Copyright (c) 2026 Harunjeylan.
+
+The problem this solves was mapped against cargo's own lock behaviour
+(`src/compiler/layout.rs`), `cargo nextest archive`, `sccache`, nightly
+`-Zfine-grain-locking` (rust-lang/cargo#4282), and the per-user build cache goal
+(rust-lang/cargo#5931). Links to each are in the table above.

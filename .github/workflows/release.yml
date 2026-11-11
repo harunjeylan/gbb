@@ -1,0 +1,30 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked
+      - run: |
+          mkdir -p dist
+          cp target/release/gbb dist/gbb
+          cp README.md LICENSE dist/
+          tar -C dist -czf "gbb-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" gbb README.md LICENSE
+          tar -C dist -czf "gbb-x86_64-unknown-linux-gnu.tar.gz" gbb README.md LICENSE
+          sha256sum gbb-*.tar.gz > SHA256SUMS
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 ||
+            gh release create "$GITHUB_REF_NAME" --title "gbb $GITHUB_REF_NAME" --notes "Release $GITHUB_REF_NAME"
+          gh release upload "$GITHUB_REF_NAME" \
+            gbb-*.tar.gz SHA256SUMS install.sh --clobber

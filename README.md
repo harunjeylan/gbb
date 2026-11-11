@@ -31,8 +31,20 @@ that produces two distinct failures:
 
 ## Install
 
+Prebuilt Linux x86_64 binary, one command:
+
 ```sh
-cargo install --path .            # or: cargo install gbb (once published)
+curl -fsSL https://github.com/harunjeylan/gbb/releases/latest/download/install.sh | sh
+```
+
+It installs to `~/.local/bin/gbb`. Override the destination with
+`GBB_INSTALL_DIR="$HOME/bin" curl ... | sh`, or pin a version with
+`GBB_VERSION=v0.1.0 curl ... | sh`.
+
+From source:
+
+```sh
+cargo install --path .
 install -m755 target/release/gbb ~/.local/bin/gbb
 ```
 

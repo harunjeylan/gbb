@@ -39,8 +39,9 @@ OPTIONS (before the cargo subcommand)
   --no-dedupe      never join or reuse an identical job
   --slot <class>   force slot class: light | heavy
   --priority       same as --slot heavy (merge gates)
-  --isolated       use a private build dir (target/agents/<id>) so parallel
-                   invocations in one checkout stop serializing
+  --isolated       use a private build dir (default: on)
+  --shared         use the shared build dir and wait for other jobs instead
+                   of taking a private, cache-seeded one
 
 EXIT CODES
   0 ok · 1 build/test failure · 2 usage · 75 busy (retry later or `gbb wait <key>`)
@@ -138,7 +139,7 @@ fn parse(argv: &[String]) -> (Opts, Option<String>) {
             .map(Duration::from_secs)
             .unwrap_or(Duration::ZERO),
         dedupe: true,
-        isolated: false,
+        isolated: true,
         class: None,
         cargo_args: Vec::new(),
     };
@@ -159,6 +160,7 @@ fn parse(argv: &[String]) -> (Opts, Option<String>) {
             }
             "--no-dedupe" => opts.dedupe = false,
             "--isolated" => opts.isolated = true,
+            "--shared" => opts.isolated = false,
             "--priority" => opts.class = Some(Class::Heavy),
             "--slot" => {
                 index += 1;
@@ -208,11 +210,25 @@ fn run(opts: Opts) -> io::Result<u8> {
         Duration::from_secs(env_u64("GBB_LOCK_WAIT", 240))
     };
 
+    // Isolation is the default because it is what removes waiting, but a
+    // private build dir costs disk. Never start one that the disk cannot hold.
+    let reserve_gb = env_u64("GBB_RESERVE_GB", 25);
+    let mut isolated = opts.isolated;
+    if isolated {
+        let free = gc::free_gb();
+        if free < reserve_gb + 12 {
+            eprintln!(
+                "gbb: only {free} GB free (reserve {reserve_gb} GB) — falling back to the shared build dir"
+            );
+            isolated = false;
+        }
+    }
+
     // 1. An identical command already owns this build directory: join it.
     //    Compare argv, not the input digest: the first build may create
     //    Cargo.lock, which would change the digest for every later agent.
-    //    Isolated build dirs are private, so nothing can be joined there.
-    if opts.dedupe && !opts.isolated {
+    //    Private build dirs are not joined; they exist to run alongside.
+    if opts.dedupe && !isolated {
         if let Some((owner_key, _pid, _started, owner_args)) = jobs::read_owner(&resolved.target) {
             let same_command = owner_args == opts.cargo_args.join(" ");
             let live = jobs::read(&owner_key).map(|j| j.is_live()).unwrap_or(false);
@@ -239,10 +255,10 @@ fn run(opts: Opts) -> io::Result<u8> {
         ));
     };
 
-    // 3. Pick the build directory: shared by default, private with --isolated.
+    // 3. Pick the build directory: private by default, shared with --shared.
     let mut build_dir = resolved.target.clone();
     let mut _isolated_claim: Option<File> = None;
-    if opts.isolated {
+    if isolated {
         match claim_isolated(&resolved.target, &isolated_id(&cwd))? {
             Some((dir, claim)) => {
                 eprintln!("gbb: isolated build dir {}", dir.display());
@@ -341,7 +357,7 @@ fn run(opts: Opts) -> io::Result<u8> {
     jobs::write(&job)?;
     let _ = jobs::write_owner(&build_dir, &job);
 
-    let target_override = opts.isolated.then_some(build_dir.as_path());
+    let target_override = isolated.then_some(build_dir.as_path());
     let outcome = runner::run(&opts.cargo_args, &log, class, target_override)?;
 
     job.finish(outcome.exit);
@@ -350,12 +366,9 @@ fn run(opts: Opts) -> io::Result<u8> {
     jobs::record_duration(class.as_str(), &cmd, outcome.secs);
 
     // 9. Refresh the shared cache so the next cold checkout starts warm.
-    if cache::enabled() && outcome.exit == 0 && reuse_allowed(&cmd, &opts.cargo_args) {
-        match cache::store(&build_dir, &workspace, &profile, &digest) {
-            Ok(Some(path)) => eprintln!("gbb: build dir cached → {}", path.display()),
-            Ok(None) => {}
-            Err(e) => eprintln!("gbb: cache snapshot skipped: {e}"),
-        }
+    //    Copies take minutes on a loaded disk, so this is a detached child.
+    if outcome.exit == 0 && reuse_allowed(&cmd, &opts.cargo_args) {
+        cache::spawn_store(&build_dir, &workspace, &profile, &digest);
     }
 
     eprintln!(
@@ -571,13 +584,16 @@ fn acquire_build_lock(
     }
 }
 
-/// Stable id for `--isolated`: an explicit GBB_AGENT wins so several processes
-/// can deliberately share one warm private build dir.
+/// Stable id for a private build dir: GBB_NAME (or legacy GBB_AGENT) lets
+/// several processes deliberately share one warm dir; otherwise the checkout
+/// identifies the dir and a concurrent second run takes the next free suffix.
 fn isolated_id(cwd: &Path) -> String {
-    if let Ok(agent) = env::var("GBB_AGENT") {
-        let agent = agent.trim();
-        if !agent.is_empty() {
-            return sanitize(agent);
+    for var in ["GBB_NAME", "GBB_AGENT"] {
+        if let Ok(name) = env::var(var) {
+            let name = name.trim();
+            if !name.is_empty() {
+                return sanitize(name);
+            }
         }
     }
     format!("w{:08x}", hash_str(&cwd.to_string_lossy()))
@@ -610,10 +626,10 @@ fn hash_str(s: &str) -> u32 {
     (hasher.finish() & 0xffff_ffff) as u32
 }
 
-/// Take a private build dir under `<target>/agents/`. A claim lock keeps two
-/// concurrent `--isolated` runs apart while repeated runs stay warm.
+/// Take a private build dir under `<target>/parallel/`. A claim lock keeps two
+/// concurrent runs apart while repeated runs in the same checkout stay warm.
 fn claim_isolated(target_root: &Path, base: &str) -> io::Result<Option<(PathBuf, File)>> {
-    let root = target_root.join("agents");
+    let root = target_root.join("parallel");
     std::fs::create_dir_all(&root)?;
 
     for suffix in 0..8 {
@@ -749,6 +765,10 @@ fn wait_command(argv: &[String]) -> io::Result<u8> {
 }
 
 fn cache_command(argv: &[String]) -> io::Result<u8> {
+    if argv.iter().any(|arg| arg == "--store") {
+        return store_from_environment();
+    }
+
     let apply = argv.iter().any(|a| a == "--apply");
     let budget_gb = env_u64("GBB_CACHE_GB", 80);
     let budget = budget_gb * 1024 * 1024 * 1024;
@@ -794,6 +814,32 @@ fn cache_command(argv: &[String]) -> io::Result<u8> {
     Ok(0)
 }
 
+/// Detached snapshot worker: only runs when it can take the build-dir lock, so
+/// it never copies a directory that another build is rewriting.
+fn store_from_environment() -> io::Result<u8> {
+    let Some(build_dir) = env::var_os("GBB_STORE_BUILD_DIR").map(PathBuf::from) else {
+        return Ok(0);
+    };
+    let workspace = env::var("GBB_STORE_WORKSPACE").unwrap_or_default();
+    let profile = env::var("GBB_STORE_PROFILE").unwrap_or_else(|_| "dev".into());
+    let digest = env::var("GBB_STORE_DIGEST").unwrap_or_default();
+    if workspace.is_empty() || digest.is_empty() {
+        return Ok(0);
+    }
+
+    let lock_path = profile_lock_path(&build_dir, &profile);
+    let Some(_lock) = acquire_build_lock(&lock_path, Duration::ZERO, &build_dir)? else {
+        eprintln!("gbb: cache snapshot skipped (build dir busy)");
+        return Ok(0);
+    };
+
+    match cache::store(&build_dir, &workspace, &profile, &digest)? {
+        Some(path) => eprintln!("gbb: cached build dir → {}", path.display()),
+        None => eprintln!("gbb: cache snapshot not needed"),
+    }
+    Ok(0)
+}
+
 fn gc_command(argv: &[String]) -> io::Result<u8> {
     let mut apply = false;
     let mut days = 7u64;
@@ -822,13 +868,14 @@ fn gc_command(argv: &[String]) -> io::Result<u8> {
 
     let cwd = env::current_dir()?;
     let resolved = target::resolve(&cwd)?;
-    let candidates = gc::collect(&resolved.root);
+    let mut candidates = gc::collect(&resolved.root);
+    candidates.extend(gc::parallel_dirs(&resolved.target));
     let free = gc::free_gb();
 
     println!("free disk: {free} GB");
     println!(
         "{:<70} {:>9} {:>6} {:>6} {:>7}  eligible",
-        "worktree", "size", "idle", "dirty", "target"
+        "path", "size", "idle", "dirty", "kind"
     );
     let mut reclaimable = 0u64;
     for candidate in &candidates {
@@ -836,13 +883,17 @@ fn gc_command(argv: &[String]) -> io::Result<u8> {
         if eligible {
             reclaimable += candidate.size_mb;
         }
+        let kind = match candidate.kind {
+            gc::Kind::WorktreeTarget => "worktree",
+            gc::Kind::ParallelDir => "parallel",
+        };
         println!(
             "{:<70} {:>7} MB {:>4}d {:>6} {:>7}  {}",
             trim(&candidate.path.to_string_lossy(), 70),
             candidate.size_mb,
             candidate.idle_days,
             candidate.dirty,
-            candidate.has_target,
+            kind,
             if eligible { "yes" } else { "no" }
         );
     }

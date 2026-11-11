@@ -18,14 +18,49 @@ pub struct Slot {
 
 fn count_for(class: Class) -> usize {
     let (var, default) = match class {
-        Class::Light => ("GBB_LIGHT_SLOTS", 4usize),
-        Class::Heavy => ("GBB_HEAVY_SLOTS", 2usize),
+        Class::Light => ("GBB_LIGHT_SLOTS", 6usize),
+        Class::Heavy => ("GBB_HEAVY_SLOTS", 3usize),
     };
     env::var(var)
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|n| *n > 0)
         .unwrap_or(default)
+}
+
+/// One goldenbee-style link peaks around 5-6 GB. Admission is therefore limited
+/// by actual available memory, not only by the configured slot count, so the box
+/// does not swap itself to death when several builds start together.
+fn job_memory_bytes() -> u64 {
+    env::var("GBB_JOB_MEM_GB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(4)
+        * 1024
+        * 1024
+        * 1024
+}
+
+fn mem_available_bytes() -> u64 {
+    let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
+        return u64::MAX;
+    };
+    text.lines()
+        .find(|line| line.starts_with("MemAvailable:"))
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|kb| kb.parse::<u64>().ok())
+        .map(|kb| kb * 1024)
+        .unwrap_or(u64::MAX)
+}
+
+pub fn admitted(class: Class) -> usize {
+    let total = count_for(class);
+    if class != Class::Heavy {
+        return total;
+    }
+    let by_memory = (mem_available_bytes() / job_memory_bytes()).max(1) as usize;
+    total.min(by_memory)
 }
 
 fn path_for(class: Class, index: usize) -> PathBuf {
@@ -45,7 +80,8 @@ fn open(path: &PathBuf) -> io::Result<File> {
 pub fn acquire(class: Class, timeout: Duration) -> io::Result<Option<Slot>> {
     let deadline = Instant::now() + timeout;
     loop {
-        for index in 0..count_for(class) {
+        let admitted_now = admitted(class);
+        for index in 0..admitted_now {
             let path = path_for(class, index);
             let file = open(&path)?;
             match file.try_lock() {
@@ -64,11 +100,10 @@ pub fn acquire(class: Class, timeout: Duration) -> io::Result<Option<Slot>> {
     }
 }
 
-/// Slots currently held, for `gbb status`.
+/// Slots currently held and the number the machine can admit right now.
 pub fn occupancy(class: Class) -> (usize, usize) {
-    let total = count_for(class);
     let mut used = 0;
-    for index in 0..total {
+    for index in 0..count_for(class) {
         let path = path_for(class, index);
         if let Ok(file) = open(&path) {
             match file.try_lock() {
@@ -79,7 +114,7 @@ pub fn occupancy(class: Class) -> (usize, usize) {
             }
         }
     }
-    (used, total)
+    (used, admitted(class))
 }
 
 /// ETA for a queued job, from observed durations. Never a guess from thin air.

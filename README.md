@@ -17,8 +17,10 @@ that produces two distinct failures:
 
 | Layer | Behaviour |
 |---|---|
-| **Per-build-dir lock** | Serializes cargo per build directory and profile (cargo's own granularity). Different worktrees build in parallel. |
-| **Memory-aware slots** | Global admission: `light` (check/clippy/fmt) ×4, `heavy` (build/test/run/bench) ×2. RAM is machine-wide, so this cap is too. |
+| **Private build dirs (default)** | Each invocation gets `<target>/parallel/<id>`, so nothing waits for another command. Repeated runs in one checkout reuse the same warm dir; concurrent runs take `-2`, `-3`, … |
+| **Shared mode** | `--shared` restores the classic behaviour: one build dir with joining and lock wait, for when disk matters more than latency. |
+| **Memory-aware slots** | Global admission: `light` ×6, `heavy` ×3, further capped by `MemAvailable / GBB_JOB_MEM_GB`. RAM is machine-wide, so this cap is too. |
+| **Disk-aware** | Private dirs and cache seeds are refused when free space drops below `GBB_RESERVE_GB` (default 25 GB); snapshots prune instead of filling the disk. |
 | **Dedupe** | An identical command already running in the same build dir is *joined*, not duplicated. Its captured output is replayed to the joiner, including failures. |
 | **Reuse** | A just-finished identical job (same argv + same input digest) is reused for 120 s. Never for `test`/`run`/`bench`: those produce observations, not artifacts. |
 | **Fail fast** | No slot or foreign holder → exit `75` with the holder, its age, ETA from observed durations, and the key to wait on. Agents stop hanging on locks. |
@@ -40,10 +42,10 @@ runtime and their absence only removes isolation/caching, never correctness.
 ## Usage
 
 ```sh
-gbb check -p goldenbee            # light slot, per-build-dir lock
-gbb test -p goldenbee filter      # heavy slot
-gbb --wait 300 test -p goldenbee  # block up to 5 min for a slot/lock
-gbb --priority test -p goldenbee  # merge gate: force a heavy slot
+gbb check -p goldenbee            # light slot, private build dir
+gbb test -p goldenbee filter      # heavy slot, private build dir
+gbb --shared test -p goldenbee    # one shared dir: join or wait instead
+gbb --wait 300 test -p goldenbee  # block up to 5 min for a slot
 gbb status                        # slots, running jobs, free disk
 gbb doctor                        # resolved build dir, digest time, tool presence
 gbb cache                         # snapshots, size, budget
@@ -89,19 +91,25 @@ checkout warm:
 repo), and cargo rebuilds it without losing artifact reuse.
 
 This machine is ext4, so there is no reflink and no copy-on-write: a snapshot is a
-real copy. It is still the cheaper half — 13 GB of deps copies in seconds versus
-10+ minutes of compilation — and the copy cannot corrupt a live build dir because
-seeding only ever fills an empty one.
+real copy. Measured here while fully loaded: **28 MB/s**, i.e. ~7 minutes for a
+13 GB `deps/` — so snapshots run in a **detached background child**, never inline,
+and they only start when no other gbb job is running (it takes the build-dir lock
+first, so it can never copy a directory another build is rewriting). Seeding a cold
+dir is inline, because it is still cheaper than the rebuild it replaces.
+
 
 ## Environment
 
 | variable | default | purpose |
 |---|---|---|
 | `GBB_WAIT` | `0` | default `--wait` seconds |
-| `GBB_LOCK_WAIT` | `240` | how long to queue behind the same build dir |
+| `GBB_LOCK_WAIT` | `240` | how long to queue behind the same build dir (shared mode) |
 | `GBB_JOIN_WAIT` | `900` | how long to wait on a joined identical job |
-| `GBB_LIGHT_SLOTS` | `4` | concurrent light jobs |
-| `GBB_HEAVY_SLOTS` | `2` | concurrent heavy jobs |
+| `GBB_LIGHT_SLOTS` | `6` | concurrent light jobs |
+| `GBB_HEAVY_SLOTS` | `3` | concurrent heavy jobs (also capped by available RAM) |
+| `GBB_JOB_MEM_GB` | `4` | memory assumed per heavy job for admission |
+| `GBB_RESERVE_GB` | `25` | disk that must stay free before private dirs/cache seeds |
+| `GBB_NAME` | unset | stable private-dir name (falls back to checkout hash) |
 | `GBB_JOBS` | inherited | `CARGO_BUILD_JOBS` for launched jobs |
 | `GBB_SLICE` | `dev.slice` | systemd slice |
 | `GBB_NO_SYSTEMD` | unset | launch cargo directly |
@@ -111,9 +119,16 @@ seeding only ever fills an empty one.
 | `GBB_CACHE_GB` | `80` | snapshot cache budget |
 | `GBB_SNAPSHOT_MAX_GB` | `30` | largest build dir worth snapshotting |
 | `GBB_SNAPSHOT_MIN_SECS` | `300` | min age before re-snapshotting the same digest |
+| `GBB_STORE_FORCE` | unset | snapshot even while other jobs are running |
 
 ## Design notes
 
+- **No waiting is the default.** A private build dir per invocation is the only way two
+  `cargo` commands can run at once in one checkout; sharing a build dir means cargo
+  serializes, and no scheduler can change that. `--shared` is the opt-out for when disk
+  is the scarcer resource.
+- **Private dirs are disposable.** `gbb gc` lists `target/parallel/*` next to worktree
+  targets and deletes them only with `--apply`, after `--days`.
 - **Lock identity is the resolved build dir**, not the repo and not the user. A
   per-user lock is what breaks parallelism across worktrees; a per-repo lock is
   wrong when two worktrees deliberately share a target dir.

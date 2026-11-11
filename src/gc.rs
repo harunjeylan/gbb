@@ -8,6 +8,14 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// `<worktree>/target` — the checkout's shared build dir.
+    WorktreeTarget,
+    /// `<target>/parallel/<id>` — one disposable private dir per invocation.
+    ParallelDir,
+}
+
 pub struct Candidate {
     pub path: PathBuf,
     pub size_mb: u64,
@@ -15,6 +23,7 @@ pub struct Candidate {
     pub dirty: bool,
     pub has_target: bool,
     pub current: bool,
+    pub kind: Kind,
 }
 
 impl Candidate {
@@ -62,10 +71,52 @@ pub fn collect(repo: &Path) -> Vec<Candidate> {
             dirty: is_dirty(&path),
             has_target,
             current: canonical == current,
+            kind: Kind::WorktreeTarget,
             path,
         });
     }
 
+    out.sort_by_key(|c| std::cmp::Reverse(c.size_mb));
+    out
+}
+
+/// Private build dirs created by parallel invocations (`target/parallel/*`).
+/// They are disposable: pruning them only costs the next run a reseed.
+pub fn parallel_dirs(target_root: &Path) -> Vec<Candidate> {
+    let root = target_root.join("parallel");
+    let Ok(entries) = fs::read_dir(&root) else {
+        return Vec::new();
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let idle_days = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| now.saturating_sub(d.as_secs()) / 86_400)
+            .unwrap_or(0);
+
+        out.push(Candidate {
+            size_mb: du_mb(&path),
+            idle_days,
+            dirty: false,
+            has_target: true,
+            current: false,
+            kind: Kind::ParallelDir,
+            path,
+        });
+    }
     out.sort_by_key(|c| std::cmp::Reverse(c.size_mb));
     out
 }
@@ -92,7 +143,10 @@ pub fn apply(candidates: &[Candidate], max_idle_days: u64, include_current: bool
         if !candidate.eligible(max_idle_days, include_current) {
             continue;
         }
-        let target = candidate.path.join("target");
+        let target = match candidate.kind {
+            Kind::WorktreeTarget => candidate.path.join("target"),
+            Kind::ParallelDir => candidate.path.clone(),
+        };
         if fs::remove_dir_all(&target).is_ok() {
             freed_mb += candidate.size_mb;
             removed += 1;
@@ -154,6 +208,7 @@ mod tests {
             dirty,
             has_target: true,
             current,
+            kind: Kind::WorktreeTarget,
         }
     }
 

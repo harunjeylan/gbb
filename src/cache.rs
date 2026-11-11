@@ -12,14 +12,14 @@
 
 use crate::jobs;
 use std::collections::hash_map::DefaultHasher;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 /// Directories that are never worth copying between build dirs.
-const SKIP_DIRS: &[&str] = &["incremental", "tmp", "agents"];
+const SKIP_DIRS: &[&str] = &["incremental", "tmp", "parallel", "agents"];
 
 pub struct Entry {
     pub dir: PathBuf,
@@ -33,6 +33,11 @@ pub struct Entry {
 
 pub fn enabled() -> bool {
     !crate::env_flag("GBB_NO_CACHE")
+}
+
+/// Disk kept free for builds themselves, never handed to the cache.
+fn reserve_gb() -> u64 {
+    crate::env_u64("GBB_RESERVE_GB", 25)
 }
 
 fn cache_gb() -> u64 {
@@ -158,6 +163,16 @@ pub fn seed(build_dir: &Path, workspace: &str, profile: &str) -> io::Result<Opti
         return Ok(None);
     }
 
+    let needed_gb = newest.bytes / (1024 * 1024 * 1024) + 1;
+    let free = crate::gc::free_gb();
+    if free < reserve_gb() + needed_gb {
+        eprintln!(
+            "gbb: cache seed skipped ({free} GB free, need {} GB)",
+            reserve_gb() + needed_gb
+        );
+        return Ok(None);
+    }
+
     if build_dir.exists() {
         // Only ever fill an empty shell; never merge into a live build dir.
         // Every build dir holds our own lock file, so ignore those.
@@ -178,6 +193,59 @@ pub fn seed(build_dir: &Path, workspace: &str, profile: &str) -> io::Result<Opti
     fs::create_dir_all(build_dir)?;
     copy_tree(&from, build_dir, usize::MAX)?;
     Ok(Some(newest.digest))
+}
+
+/// Copying a 13 GB build dir is minutes on a loaded disk, so snapshots happen
+/// in a detached child that only runs when no other job is building.
+pub fn spawn_store(build_dir: &Path, workspace: &str, profile: &str, digest: &str) {
+    if !enabled() {
+        return;
+    }
+
+    let others = jobs::running_jobs()
+        .iter()
+        .filter(|job| job.pid != std::process::id())
+        .count();
+    if others > 0 && !crate::env_flag("GBB_STORE_FORCE") {
+        eprintln!("gbb: cache snapshot deferred ({others} other job(s) running)");
+        return;
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let log = jobs::cache_dir().join("store.log");
+
+    let mut command = Command::new(exe);
+    command
+        .arg("cache")
+        .arg("--store")
+        .env("GBB_STORE_BUILD_DIR", build_dir)
+        .env("GBB_STORE_WORKSPACE", workspace)
+        .env("GBB_STORE_PROFILE", profile)
+        .env("GBB_STORE_DIGEST", digest)
+        .stdin(Stdio::null());
+
+    match OpenOptions::new().create(true).append(true).open(&log) {
+        Ok(file) => {
+            let clone = file.try_clone();
+            command.stdout(file);
+            if let Ok(file) = clone {
+                command.stderr(file);
+            }
+        }
+        Err(_) => {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
+
+    match command.spawn() {
+        Ok(_) => eprintln!(
+            "gbb: caching build dir in background (log: {})",
+            log.display()
+        ),
+        Err(e) => eprintln!("gbb: cache snapshot skipped: {e}"),
+    }
 }
 
 /// Snapshot a build dir after a successful build, unless an identical one exists.
@@ -205,6 +273,17 @@ pub fn store(
     let destination = targets_root(workspace, profile).join(digest);
     if destination.is_dir() {
         return Ok(None);
+    }
+
+    // Snapshots must never be the reason a build cannot run.
+    if crate::gc::free_gb() < reserve_gb() + 2 {
+        let _ = prune(cache_gb() * 1024 * 1024 * 1024, true);
+        let free = crate::gc::free_gb();
+        if free < reserve_gb() + 2 {
+            let reserve = reserve_gb();
+            eprintln!("gbb: cache snapshot skipped ({free} GB free, reserve {reserve} GB)");
+            return Ok(None);
+        }
     }
 
     let staging = targets_root(workspace, profile).join(format!(".staging-{}", std::process::id()));

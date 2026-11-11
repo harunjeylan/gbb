@@ -12,10 +12,12 @@ mod digest;
 mod gc;
 mod jobs;
 mod runner;
+mod settings;
 mod slots;
 mod target;
 
 use classify::Class;
+use settings::Settings;
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -87,18 +89,19 @@ fn main() -> ExitCode {
             println!("gbb {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        "status" => report(status()),
-        "doctor" => report(doctor()),
+        "status" => report(status(&Settings::load())),
+        "doctor" => report(doctor(&Settings::load())),
         "gc" => report(gc_command(&argv[1..])),
-        "cache" => report(cache_command(&argv[1..])),
+        "cache" => report(cache_command(&argv[1..], &Settings::load())),
         "wait" => report(wait_command(&argv[1..])),
         _ => {
-            let (opts, err) = parse(&argv);
+            let settings = Settings::load();
+            let (opts, err) = parse(&argv, &settings);
             if let Some(message) = err {
                 eprintln!("gbb: {message}\n\n{HELP}");
                 return ExitCode::from(EXIT_USAGE);
             }
-            report(run(opts))
+            report(run(opts, &settings))
         }
     }
 }
@@ -142,13 +145,9 @@ fn report(result: io::Result<u8>) -> ExitCode {
     }
 }
 
-fn parse(argv: &[String]) -> (Opts, Option<String>) {
+fn parse(argv: &[String], settings: &Settings) -> (Opts, Option<String>) {
     let mut opts = Opts {
-        wait: env::var("GBB_WAIT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .map(Duration::from_secs)
-            .unwrap_or(Duration::ZERO),
+        wait: settings.wait,
         dedupe: true,
         isolated: true,
         class: None,
@@ -197,7 +196,7 @@ fn parse(argv: &[String]) -> (Opts, Option<String>) {
     (opts, None)
 }
 
-fn run(opts: Opts) -> io::Result<u8> {
+fn run(opts: Opts, settings: &Settings) -> io::Result<u8> {
     let cwd = env::current_dir()?;
     let resolved = match target::resolve(&cwd) {
         Ok(r) => r,
@@ -214,16 +213,16 @@ fn run(opts: Opts) -> io::Result<u8> {
         .unwrap_or("")
         .to_string();
 
-    let join_wait = Duration::from_secs(env_u64("GBB_JOIN_WAIT", 900));
+    let join_wait = settings.join_wait;
     let lock_wait = if opts.wait > Duration::ZERO {
         opts.wait
     } else {
-        Duration::from_secs(env_u64("GBB_LOCK_WAIT", 240))
+        settings.lock_wait
     };
 
     // Isolation is the default because it is what removes waiting, but a
     // private build dir costs disk. Never start one that the disk cannot hold.
-    let reserve_gb = env_u64("GBB_RESERVE_GB", 25);
+    let reserve_gb = settings.reserve_gb;
     let mut isolated = opts.isolated;
     if isolated {
         let free = gc::free_gb();
@@ -258,7 +257,7 @@ fn run(opts: Opts) -> io::Result<u8> {
     let mut build_dir = resolved.target.clone();
     let mut _isolated_claim: Option<File> = None;
     if isolated {
-        match claim_isolated(&resolved.target, &isolated_id(&cwd))? {
+        match claim_isolated(&resolved.target, &isolated_id(&cwd, settings))? {
             Some((dir, claim)) => {
                 eprintln!("gbb: isolated build dir {}", dir.display());
                 build_dir = dir;
@@ -272,6 +271,7 @@ fn run(opts: Opts) -> io::Result<u8> {
                     None,
                     "isolated",
                     "every isolated build dir for this agent id is busy",
+                    settings,
                 ))
             }
         }
@@ -290,13 +290,14 @@ fn run(opts: Opts) -> io::Result<u8> {
                 None,
                 "build-dir",
                 "another gbb job owns this build directory and did not finish in time",
+                settings,
             ))
         }
     };
 
     // 4. Memory is admitted only once this run is about to consume it. Queueing
     //    for the build dir must not occupy a slot the whole time.
-    let Some(_slot) = slots::acquire(class, opts.wait)? else {
+    let Some(_slot) = slots::acquire(class, opts.wait, settings)? else {
         return Ok(busy(
             class,
             &cmd,
@@ -304,6 +305,7 @@ fn run(opts: Opts) -> io::Result<u8> {
             None,
             "slot",
             "no free slot; nothing was started",
+            settings,
         ));
     };
 
@@ -319,7 +321,7 @@ fn run(opts: Opts) -> io::Result<u8> {
     //    recompiles only what changed instead of everything.
     let workspace = cache::workspace_key(&resolved.root);
     if cache::is_cold(&build_dir, &profile) {
-        match cache::seed(&build_dir, &workspace, &profile) {
+        match cache::seed(&build_dir, &workspace, &profile, settings) {
             Ok(Some(seed_digest)) => eprintln!(
                 "gbb: cold build dir seeded from cache (digest {})",
                 short(&seed_digest)
@@ -338,10 +340,7 @@ fn run(opts: Opts) -> io::Result<u8> {
     // 7. Someone with the same key may have finished while we queued.
     if opts.dedupe && reuse_allowed(&cmd, &opts.cargo_args) {
         if let Some(job) = jobs::read(&key) {
-            let window = env::var("GBB_REUSE_SECS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(120u64);
+            let window = settings.reuse_secs;
             let finished_ago = jobs::now_epoch().saturating_sub(job.finished);
             if job.state == jobs::State::Done && job.finished > 0 && finished_ago <= window {
                 eprintln!(
@@ -370,7 +369,7 @@ fn run(opts: Opts) -> io::Result<u8> {
     let _ = jobs::write_owner(&build_dir, &job);
 
     let target_override = isolated.then_some(build_dir.as_path());
-    let outcome = runner::run(&opts.cargo_args, &log, class, target_override)?;
+    let outcome = runner::run(&opts.cargo_args, &log, class, target_override, settings)?;
 
     job.finish(outcome.exit);
     jobs::write(&job)?;
@@ -380,7 +379,7 @@ fn run(opts: Opts) -> io::Result<u8> {
     // 9. Refresh the shared cache so the next cold checkout starts warm.
     //    Copies take minutes on a loaded disk, so this is a detached child.
     if outcome.exit == 0 && reuse_allowed(&cmd, &opts.cargo_args) {
-        cache::spawn_store(&build_dir, &workspace, &profile, &digest);
+        cache::spawn_store(&build_dir, &workspace, &profile, &digest, settings);
     }
 
     eprintln!(
@@ -398,8 +397,9 @@ fn busy(
     key: Option<&str>,
     reason: &str,
     detail: &str,
+    settings: &Settings,
 ) -> u8 {
-    let (used, total) = slots::occupancy(class);
+    let (used, total) = slots::occupancy(class, settings);
     let eta = slots::eta_text(class, cmd);
     let owner = jobs::read_owner(target);
 
@@ -438,21 +438,6 @@ fn busy(
         }
     }
     EXIT_BUSY
-}
-
-fn env_u64(name: &str, default: u64) -> u64 {
-    env::var(name)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(default)
-}
-
-/// An env switch counts only when set to something non-empty, so
-/// `export GBB_NO_CACHE=` in a shell profile cannot silently change behaviour.
-fn env_flag(name: &str) -> bool {
-    env::var_os(name)
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
 }
 
 /// Reusing a finished job is only safe when it produced artifacts rather than
@@ -599,14 +584,9 @@ fn acquire_build_lock(
 /// Stable id for a private build dir: GBB_NAME (or legacy GBB_AGENT) lets
 /// several processes deliberately share one warm dir; otherwise the checkout
 /// identifies the dir and a concurrent second run takes the next free suffix.
-fn isolated_id(cwd: &Path) -> String {
-    for var in ["GBB_NAME", "GBB_AGENT"] {
-        if let Ok(name) = env::var(var) {
-            let name = name.trim();
-            if !name.is_empty() {
-                return sanitize(name);
-            }
-        }
+fn isolated_id(cwd: &Path, settings: &Settings) -> String {
+    if let Some(name) = &settings.name {
+        return sanitize(name);
     }
     format!("w{:08x}", hash_str(&cwd.to_string_lossy()))
 }
@@ -690,10 +670,10 @@ fn foreign_cargo_lock(target: &Path) -> Option<PathBuf> {
     None
 }
 
-fn status() -> io::Result<u8> {
+fn status(settings: &Settings) -> io::Result<u8> {
     println!("gbb {}", env!("CARGO_PKG_VERSION"));
     for class in [Class::Light, Class::Heavy] {
-        let (used, total) = slots::occupancy(class);
+        let (used, total) = slots::occupancy(class, settings);
         println!("{:<5} slots {used}/{total}", class.as_str());
     }
     println!();
@@ -717,7 +697,7 @@ fn status() -> io::Result<u8> {
     Ok(0)
 }
 
-fn doctor() -> io::Result<u8> {
+fn doctor(settings: &Settings) -> io::Result<u8> {
     let cwd = env::current_dir()?;
     let resolved = target::resolve(&cwd)?;
     let started = Instant::now();
@@ -733,10 +713,10 @@ fn doctor() -> io::Result<u8> {
     println!("cache dir      : {}", jobs::cache_dir().display());
     println!(
         "slots          : light {}/{} · heavy {}/{}",
-        slots::occupancy(Class::Light).0,
-        slots::occupancy(Class::Light).1,
-        slots::occupancy(Class::Heavy).0,
-        slots::occupancy(Class::Heavy).1
+        slots::occupancy(Class::Light, settings).0,
+        slots::occupancy(Class::Light, settings).1,
+        slots::occupancy(Class::Heavy, settings).0,
+        slots::occupancy(Class::Heavy, settings).1
     );
     for bin in ["cargo", "systemd-run", "sccache", "mold", "ld.mold"] {
         println!(
@@ -776,13 +756,13 @@ fn wait_command(argv: &[String]) -> io::Result<u8> {
     }
 }
 
-fn cache_command(argv: &[String]) -> io::Result<u8> {
+fn cache_command(argv: &[String], settings: &Settings) -> io::Result<u8> {
     if argv.iter().any(|arg| arg == "--store") {
         return store_from_environment();
     }
 
     let apply = argv.iter().any(|a| a == "--apply");
-    let budget_gb = env_u64("GBB_CACHE_GB", 80);
+    let budget_gb = settings.cache_gb;
     let budget = budget_gb * 1024 * 1024 * 1024;
     let (removable, removable_bytes) = cache::prune(budget, false)?;
     let total = cache::total_bytes();
@@ -845,7 +825,8 @@ fn store_from_environment() -> io::Result<u8> {
         return Ok(0);
     };
 
-    match cache::store(&build_dir, &workspace, &profile, &digest)? {
+    let settings = Settings::load();
+    match cache::store(&build_dir, &workspace, &profile, &digest, &settings)? {
         Some(path) => eprintln!("gbb: cached build dir → {}", path.display()),
         None => eprintln!("gbb: cache snapshot not needed"),
     }

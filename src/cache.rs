@@ -11,6 +11,7 @@
 //! and cargo rebuilds it from scratch without losing artifact reuse.
 
 use crate::jobs;
+use crate::settings::Settings;
 use std::collections::hash_map::DefaultHasher;
 use std::fs::{self, OpenOptions};
 use std::hash::{Hash, Hasher};
@@ -31,40 +32,41 @@ pub struct Entry {
     pub workspace: String,
 }
 
-pub fn enabled() -> bool {
-    !crate::env_flag("GBB_NO_CACHE")
+pub fn enabled(settings: &Settings) -> bool {
+    settings.cache_enabled
 }
 
 /// Disk kept free for builds themselves, never handed to the cache.
-fn reserve_gb() -> u64 {
-    crate::env_u64("GBB_RESERVE_GB", 25)
+fn reserve_gb(settings: &Settings) -> u64 {
+    settings.reserve_gb
 }
 
-fn cache_gb() -> u64 {
-    crate::env_u64("GBB_CACHE_GB", 80)
+fn cache_gb(settings: &Settings) -> u64 {
+    settings.cache_gb
 }
 
-fn snapshot_max_bytes() -> u64 {
-    crate::env_u64("GBB_SNAPSHOT_MAX_GB", 30) * 1024 * 1024 * 1024
+fn snapshot_max_bytes(settings: &Settings) -> u64 {
+    settings.snapshot_max_gb * 1024 * 1024 * 1024
 }
 
-fn snapshot_min_secs() -> u64 {
-    crate::env_u64("GBB_SNAPSHOT_MIN_SECS", 300)
+fn snapshot_min_secs(settings: &Settings) -> u64 {
+    settings.snapshot_min_secs
 }
 
 /// A snapshot holds the build-dir lock, so its cost is a wait imposed on every
 /// other command in that directory. This is the cap on that wait.
-fn snapshot_max_secs() -> u64 {
-    crate::env_u64("GBB_SNAPSHOT_MAX_SECS", 60)
+fn snapshot_max_secs(settings: &Settings) -> u64 {
+    settings.snapshot_max_secs
 }
 
 /// Copy throughput in MB/s: learned from the last snapshot, overridable.
-fn copy_mbps() -> u64 {
+fn copy_mbps(settings: &Settings) -> u64 {
     fs::read_to_string(jobs::cache_dir().join("copy_mbps"))
         .ok()
         .and_then(|text| text.trim().parse::<u64>().ok())
         .filter(|n| *n > 1)
-        .unwrap_or_else(|| crate::env_u64("GBB_COPY_MBPS", 40))
+        .or(settings.copy_mbps)
+        .unwrap_or(40)
 }
 
 fn record_copy_mbps(bytes: u64, secs: u64) {
@@ -75,8 +77,8 @@ fn record_copy_mbps(bytes: u64, secs: u64) {
     let _ = fs::write(jobs::cache_dir().join("copy_mbps"), mbps.to_string());
 }
 
-fn estimated_copy_secs(bytes: u64) -> u64 {
-    bytes / (copy_mbps().max(1) * 1024 * 1024)
+fn estimated_copy_secs(bytes: u64, settings: &Settings) -> u64 {
+    bytes / (copy_mbps(settings).max(1) * 1024 * 1024)
 }
 
 fn dir_size(root: &Path) -> u64 {
@@ -201,8 +203,13 @@ fn read_meta(dir: &Path, workspace: &str, profile: &str) -> Option<Entry> {
 }
 
 /// Restore the newest snapshot into a cold build dir. Returns its digest.
-pub fn seed(build_dir: &Path, workspace: &str, profile: &str) -> io::Result<Option<String>> {
-    if !enabled() {
+pub fn seed(
+    build_dir: &Path,
+    workspace: &str,
+    profile: &str,
+    settings: &Settings,
+) -> io::Result<Option<String>> {
+    if !enabled(settings) {
         return Ok(None);
     }
     let Some(newest) = entries(workspace, profile).into_iter().next() else {
@@ -215,10 +222,10 @@ pub fn seed(build_dir: &Path, workspace: &str, profile: &str) -> io::Result<Opti
 
     let needed_gb = newest.bytes / (1024 * 1024 * 1024) + 1;
     let free = crate::gc::free_gb();
-    if free < reserve_gb() + needed_gb {
+    if free < reserve_gb(settings) + needed_gb {
         eprintln!(
             "gbb: cache seed skipped ({free} GB free, need {} GB)",
-            reserve_gb() + needed_gb
+            reserve_gb(settings) + needed_gb
         );
         return Ok(None);
     }
@@ -247,8 +254,14 @@ pub fn seed(build_dir: &Path, workspace: &str, profile: &str) -> io::Result<Opti
 
 /// Copying a 13 GB build dir is minutes on a loaded disk, so snapshots happen
 /// in a detached child that only runs when no other job is building.
-pub fn spawn_store(build_dir: &Path, workspace: &str, profile: &str, digest: &str) {
-    if !enabled() {
+pub fn spawn_store(
+    build_dir: &Path,
+    workspace: &str,
+    profile: &str,
+    digest: &str,
+    settings: &Settings,
+) {
+    if !enabled(settings) {
         return;
     }
 
@@ -256,7 +269,7 @@ pub fn spawn_store(build_dir: &Path, workspace: &str, profile: &str, digest: &st
         .iter()
         .filter(|job| job.pid != std::process::id())
         .count();
-    if others > 0 && !crate::env_flag("GBB_STORE_FORCE") {
+    if others > 0 && !settings.store_force {
         eprintln!("gbb: cache snapshot deferred ({others} other job(s) running)");
         return;
     }
@@ -304,8 +317,9 @@ pub fn store(
     workspace: &str,
     profile: &str,
     digest: &str,
+    settings: &Settings,
 ) -> io::Result<Option<PathBuf>> {
-    if !enabled() || !build_dir.is_dir() {
+    if !enabled(settings) || !build_dir.is_dir() {
         return Ok(None);
     }
     if !build_dir.join(profile_dir(profile)).is_dir() {
@@ -314,7 +328,8 @@ pub fn store(
 
     let existing = entries(workspace, profile);
     if let Some(newest) = existing.first() {
-        let fresh_enough = jobs::now_epoch().saturating_sub(newest.created) < snapshot_min_secs();
+        let fresh_enough =
+            jobs::now_epoch().saturating_sub(newest.created) < snapshot_min_secs(settings);
         if newest.digest == digest && fresh_enough {
             return Ok(None);
         }
@@ -326,11 +341,11 @@ pub fn store(
     }
 
     // Snapshots must never be the reason a build cannot run.
-    if crate::gc::free_gb() < reserve_gb() + 2 {
-        let _ = prune(cache_gb() * 1024 * 1024 * 1024, true);
+    if crate::gc::free_gb() < reserve_gb(settings) + 2 {
+        let _ = prune(cache_gb(settings) * 1024 * 1024 * 1024, true);
         let free = crate::gc::free_gb();
-        if free < reserve_gb() + 2 {
-            let reserve = reserve_gb();
+        if free < reserve_gb(settings) + 2 {
+            let reserve = reserve_gb(settings);
             eprintln!("gbb: cache snapshot skipped ({free} GB free, reserve {reserve} GB)");
             return Ok(None);
         }
@@ -339,8 +354,8 @@ pub fn store(
     // The copy holds the build-dir lock, so a slow disk turns a snapshot into the
     // very wait gbb exists to remove. Refuse the snapshot instead.
     let size = dir_size(build_dir);
-    let estimate = estimated_copy_secs(size);
-    if estimate > snapshot_max_secs() {
+    let estimate = estimated_copy_secs(size, settings);
+    if estimate > snapshot_max_secs(settings) {
         eprintln!(
             "gbb: cache snapshot skipped ({} GB would hold the build dir ~{}s)",
             size / (1024 * 1024 * 1024),
@@ -357,7 +372,7 @@ pub fn store(
     let copied = copy_tree(
         build_dir,
         &staging.join("target"),
-        snapshot_max_bytes() as usize,
+        snapshot_max_bytes(settings) as usize,
     );
     match copied {
         Ok(bytes) => {
@@ -378,7 +393,7 @@ pub fn store(
                 }
                 return Err(e);
             }
-            prune(cache_gb() * 1024 * 1024 * 1024, true)?;
+            prune(cache_gb(settings) * 1024 * 1024 * 1024, true)?;
             Ok(Some(destination))
         }
         Err(e) if e.kind() == io::ErrorKind::FileTooLarge => {
@@ -689,8 +704,9 @@ mod tests {
 
     #[test]
     fn copy_estimate_grows_with_size() {
-        let small = estimated_copy_secs(64 * 1024 * 1024);
-        let big = estimated_copy_secs(8 * 1024 * 1024 * 1024);
+        let settings = Settings::default();
+        let small = estimated_copy_secs(64 * 1024 * 1024, &settings);
+        let big = estimated_copy_secs(8 * 1024 * 1024 * 1024, &settings);
         assert!(big > small, "{big} should exceed {small}");
     }
 }

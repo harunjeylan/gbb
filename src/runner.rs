@@ -4,6 +4,7 @@
 //! why it failed, even though it never owned the build.
 
 use crate::classify::Class;
+use crate::settings::Settings;
 use std::env;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
@@ -24,11 +25,12 @@ pub fn run(
     log: &Path,
     class: Class,
     target_override: Option<&std::path::Path>,
+    settings: &Settings,
 ) -> io::Result<Outcome> {
     let started = Instant::now();
     let log_file = Arc::new(Mutex::new(open_log(log)?));
 
-    let mut command = build_command(args, class, target_override);
+    let mut command = build_command(args, class, target_override, settings);
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -106,14 +108,15 @@ fn build_command(
     args: &[String],
     class: Class,
     target_override: Option<&std::path::Path>,
+    settings: &Settings,
 ) -> Command {
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let systemd = !env_flag("GBB_NO_SYSTEMD") && which("systemd-run").is_some();
-    let slice = env::var("GBB_SLICE").unwrap_or_else(|_| "dev.slice".to_string());
+    let systemd = !settings.no_systemd && which("systemd-run").is_some();
+    let slice = settings.slice.clone();
 
     let mut envs: Vec<(String, String)> = Vec::new();
-    if let Ok(jobs) = env::var("GBB_JOBS") {
-        envs.push(("CARGO_BUILD_JOBS".into(), jobs));
+    if let Some(jobs) = &settings.jobs {
+        envs.push(("CARGO_BUILD_JOBS".into(), jobs.clone()));
     }
     if let Some(dir) = target_override {
         envs.push((
@@ -121,7 +124,7 @@ fn build_command(
             dir.to_string_lossy().into_owned(),
         ));
     }
-    envs.extend(sccache_env());
+    envs.extend(sccache_env(settings));
 
     let mut cmd = if systemd {
         let mut c = Command::new("systemd-run");
@@ -163,9 +166,9 @@ fn build_command(
 /// sccache is a force multiplier across worktrees, but it cannot cache bins,
 /// dylibs, or proc-macros and refuses incremental builds, so it is opt-in by
 /// presence and opt-out by env.
-fn sccache_env() -> Vec<(String, String)> {
+fn sccache_env(settings: &Settings) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    if env_flag("GBB_NO_SCCACHE") || which("sccache").is_none() {
+    if settings.no_sccache || which("sccache").is_none() {
         return out;
     }
     out.push(("RUSTC_WRAPPER".into(), "sccache".into()));
@@ -190,14 +193,6 @@ pub fn which(bin: &str) -> Option<std::path::PathBuf> {
     env::split_paths(&path)
         .map(|dir| dir.join(bin))
         .find(|candidate| candidate.is_file())
-}
-
-/// An env switch counts only when set to something non-empty, so
-/// `export GBB_NO_SYSTEMD=` in a shell profile cannot silently disable safety.
-fn env_flag(name: &str) -> bool {
-    env::var_os(name)
-        .map(|v| !v.is_empty() && v != "0")
-        .unwrap_or(false)
 }
 
 /// Last `n` lines of a job log, for reuse reporting.

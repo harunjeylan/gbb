@@ -6,6 +6,7 @@
 //!   * identical concurrent requests collapse into one build,
 //!   * a blocked agent exits 75 immediately instead of hanging on a lock.
 
+mod cache;
 mod classify;
 mod digest;
 mod gc;
@@ -31,13 +32,15 @@ gbb — cargo build broker for parallel agents
 
 USAGE
   gbb [options] <cargo args...>
-  gbb status | doctor | gc | wait <key> | help | version
+  gbb status | doctor | cache | gc | wait <key> | help | version
 
 OPTIONS (before the cargo subcommand)
   --wait <secs>    block up to this long for a slot/lock (default 0 = fail fast)
   --no-dedupe      never join or reuse an identical job
   --slot <class>   force slot class: light | heavy
   --priority       same as --slot heavy (merge gates)
+  --isolated       use a private build dir (target/agents/<id>) so parallel
+                   invocations in one checkout stop serializing
 
 EXIT CODES
   0 ok · 1 build/test failure · 2 usage · 75 busy (retry later or `gbb wait <key>`)
@@ -51,16 +54,23 @@ ENV
   GBB_NO_SYSTEMD      launch cargo directly instead of under systemd-run
   GBB_NO_SCCACHE      do not inject RUSTC_WRAPPER=sccache
   GBB_REUSE_SECS      reuse a just-finished identical job (default 120)
+  GBB_AGENT           stable id for --isolated build dirs (default: cwd hash)
+  GBB_NO_CACHE        disable seeding/snapshotting the shared build cache
+  GBB_CACHE_GB        cache byte budget (default 80)
+  GBB_SNAPSHOT_MAX_GB largest build dir worth snapshotting (default 30)
+  GBB_SNAPSHOT_MIN_SECS minimum age before an identical digest is re-snapshotted (default 300)
 ";
 
 struct Opts {
     wait: Duration,
     dedupe: bool,
+    isolated: bool,
     class: Option<Class>,
     cargo_args: Vec<String>,
 }
 
 fn main() -> ExitCode {
+    install_broken_pipe_guard();
     let argv: Vec<String> = env::args().skip(1).collect();
     let Some(first) = argv.first().cloned() else {
         print!("{HELP}");
@@ -79,6 +89,7 @@ fn main() -> ExitCode {
         "status" => report(status()),
         "doctor" => report(doctor()),
         "gc" => report(gc_command(&argv[1..])),
+        "cache" => report(cache_command(&argv[1..])),
         "wait" => report(wait_command(&argv[1..])),
         _ => {
             let (opts, err) = parse(&argv);
@@ -89,6 +100,24 @@ fn main() -> ExitCode {
             report(run(opts))
         }
     }
+}
+
+/// `gbb status | head` must not print a panic backtrace. Rust ignores SIGPIPE,
+/// so a closed stdout turns every `println!` into a panic; exit quietly instead.
+fn install_broken_pipe_guard() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info.payload();
+        let message = payload
+            .downcast_ref::<String>()
+            .map(|s| s.as_str())
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("");
+        if message.contains("Broken pipe") {
+            std::process::exit(0);
+        }
+        default_hook(info);
+    }));
 }
 
 fn report(result: io::Result<u8>) -> ExitCode {
@@ -109,6 +138,7 @@ fn parse(argv: &[String]) -> (Opts, Option<String>) {
             .map(Duration::from_secs)
             .unwrap_or(Duration::ZERO),
         dedupe: true,
+        isolated: false,
         class: None,
         cargo_args: Vec::new(),
     };
@@ -128,6 +158,7 @@ fn parse(argv: &[String]) -> (Opts, Option<String>) {
                 }
             }
             "--no-dedupe" => opts.dedupe = false,
+            "--isolated" => opts.isolated = true,
             "--priority" => opts.class = Some(Class::Heavy),
             "--slot" => {
                 index += 1;
@@ -180,7 +211,8 @@ fn run(opts: Opts) -> io::Result<u8> {
     // 1. An identical command already owns this build directory: join it.
     //    Compare argv, not the input digest: the first build may create
     //    Cargo.lock, which would change the digest for every later agent.
-    if opts.dedupe {
+    //    Isolated build dirs are private, so nothing can be joined there.
+    if opts.dedupe && !opts.isolated {
         if let Some((owner_key, _pid, _started, owner_args)) = jobs::read_owner(&resolved.target) {
             let same_command = owner_args == opts.cargo_args.join(" ");
             let live = jobs::read(&owner_key).map(|j| j.is_live()).unwrap_or(false);
@@ -207,16 +239,39 @@ fn run(opts: Opts) -> io::Result<u8> {
         ));
     };
 
-    // 3. One build per build directory, at cargo's own profile granularity.
+    // 3. Pick the build directory: shared by default, private with --isolated.
+    let mut build_dir = resolved.target.clone();
+    let mut _isolated_claim: Option<File> = None;
+    if opts.isolated {
+        match claim_isolated(&resolved.target, &isolated_id(&cwd))? {
+            Some((dir, claim)) => {
+                eprintln!("gbb: isolated build dir {}", dir.display());
+                build_dir = dir;
+                _isolated_claim = Some(claim);
+            }
+            None => {
+                return Ok(busy(
+                    class,
+                    &cmd,
+                    &resolved.target,
+                    None,
+                    "isolated",
+                    "every isolated build dir for this agent id is busy",
+                ))
+            }
+        }
+    }
+
+    // 4. One build per build directory, at cargo's own profile granularity.
     let profile = profile_of(&opts.cargo_args);
-    let lock_path = profile_lock_path(&resolved.target, &profile);
-    let _lock = match acquire_build_lock(&lock_path, lock_wait)? {
+    let lock_path = profile_lock_path(&build_dir, &profile);
+    let _lock = match acquire_build_lock(&lock_path, lock_wait, &build_dir)? {
         Some(file) => file,
         None => {
             return Ok(busy(
                 class,
                 &cmd,
-                &resolved.target,
+                &build_dir,
                 None,
                 "build-dir",
                 "another gbb job owns this build directory and did not finish in time",
@@ -224,7 +279,7 @@ fn run(opts: Opts) -> io::Result<u8> {
         }
     };
 
-    if let Some(foreign) = foreign_cargo_lock(&resolved.target) {
+    if let Some(foreign) = foreign_cargo_lock(&build_dir) {
         eprintln!(
             "gbb: warning: bare cargo appears to hold {}",
             foreign.display()
@@ -232,13 +287,27 @@ fn run(opts: Opts) -> io::Result<u8> {
         eprintln!("gbb:          it will not be serialized against; prefer `gbb <cmd>` everywhere");
     }
 
-    // 4. Digest is only meaningful once the tree is quiet, i.e. after the lock.
+    // 5. A cold build dir is seeded from the newest shared snapshot, so cargo
+    //    recompiles only what changed instead of everything.
+    let workspace = cache::workspace_key(&resolved.root);
+    if cache::is_cold(&build_dir, &profile) {
+        match cache::seed(&build_dir, &workspace, &profile) {
+            Ok(Some(seed_digest)) => eprintln!(
+                "gbb: cold build dir seeded from cache (digest {})",
+                short(&seed_digest)
+            ),
+            Ok(None) => {}
+            Err(e) => eprintln!("gbb: cache seed skipped: {e}"),
+        }
+    }
+
+    // 6. Digest is only meaningful once the tree is quiet, i.e. after the lock.
     let started = Instant::now();
     let digest = digest::workspace_digest(&resolved.root)?;
     let digest_ms = started.elapsed().as_millis();
-    let key = digest::job_key(&resolved.target, class.as_str(), &opts.cargo_args, &digest);
+    let key = digest::job_key(&build_dir, class.as_str(), &opts.cargo_args, &digest);
 
-    // 4. Someone with the same key may have finished while we queued.
+    // 7. Someone with the same key may have finished while we queued.
     if opts.dedupe && reuse_allowed(&cmd, &opts.cargo_args) {
         if let Some(job) = jobs::read(&key) {
             let window = env::var("GBB_REUSE_SECS")
@@ -259,25 +328,35 @@ fn run(opts: Opts) -> io::Result<u8> {
         }
     }
 
-    // 5. Build.
+    // 8. Build.
     jobs::prune_logs(24 * 60 * 60);
     let log = jobs::log_path(&key);
     let mut job = jobs::Job::started_running(
         &key,
         std::process::id(),
         class.as_str(),
-        &resolved.target,
+        &build_dir,
         &opts.cargo_args,
     );
     jobs::write(&job)?;
-    let _ = jobs::write_owner(&resolved.target, &job);
+    let _ = jobs::write_owner(&build_dir, &job);
 
-    let outcome = runner::run(&opts.cargo_args, &log, class)?;
+    let target_override = opts.isolated.then_some(build_dir.as_path());
+    let outcome = runner::run(&opts.cargo_args, &log, class, target_override)?;
 
     job.finish(outcome.exit);
     jobs::write(&job)?;
-    jobs::clear_owner(&resolved.target);
+    jobs::clear_owner(&build_dir);
     jobs::record_duration(class.as_str(), &cmd, outcome.secs);
+
+    // 9. Refresh the shared cache so the next cold checkout starts warm.
+    if cache::enabled() && outcome.exit == 0 && reuse_allowed(&cmd, &opts.cargo_args) {
+        match cache::store(&build_dir, &workspace, &profile, &digest) {
+            Ok(Some(path)) => eprintln!("gbb: build dir cached → {}", path.display()),
+            Ok(None) => {}
+            Err(e) => eprintln!("gbb: cache snapshot skipped: {e}"),
+        }
+    }
 
     eprintln!(
         "gbb: {class} {cmd} finished in {}s (exit {}, digest {}ms)",
@@ -343,6 +422,14 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// An env switch counts only when set to something non-empty, so
+/// `export GBB_NO_CACHE=` in a shell profile cannot silently change behaviour.
+fn env_flag(name: &str) -> bool {
+    env::var_os(name)
+        .map(|v| !v.is_empty() && v != "0")
+        .unwrap_or(false)
+}
+
 /// Reusing a finished job is only safe when it produced artifacts rather than
 /// observations. Test/run/bench must execute again: flaky and side-effectful
 /// results are not cacheable, even with an identical input digest.
@@ -354,13 +441,20 @@ fn reuse_allowed(cmd: &str, args: &[String]) -> bool {
 }
 
 fn wait_for_job(key: &str, timeout: Duration) -> io::Result<u8> {
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut announced = 0u64;
     eprintln!(
-        "gbb: waiting for job {} (timeout {}s)",
+        "gbb: waiting for job {} (timeout {}s, Ctrl-C keeps the owner building)",
         short(key),
         timeout.as_secs()
     );
     loop {
+        let elapsed = started.elapsed().as_secs();
+        if elapsed >= 10 && elapsed / 10 > announced {
+            announced = elapsed / 10;
+            eprintln!("gbb: still waiting for job {} ({elapsed}s)", short(key));
+        }
         match jobs::read(key) {
             Some(job) if job.state == jobs::State::Done => {
                 replay(key);
@@ -425,7 +519,11 @@ fn profile_lock_path(target: &Path, profile: &str) -> PathBuf {
     target.join(format!(".gbb-{profile}.lock"))
 }
 
-fn acquire_build_lock(path: &Path, timeout: Duration) -> io::Result<Option<File>> {
+fn acquire_build_lock(
+    path: &Path,
+    timeout: Duration,
+    build_dir: &Path,
+) -> io::Result<Option<File>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -436,11 +534,33 @@ fn acquire_build_lock(path: &Path, timeout: Duration) -> io::Result<Option<File>
         .read(true)
         .open(path)?;
 
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let mut announced = false;
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(Some(file)),
+            Ok(()) => {
+                if announced {
+                    eprintln!("gbb: build dir free after {}s", started.elapsed().as_secs());
+                }
+                return Ok(Some(file));
+            }
             Err(std::fs::TryLockError::WouldBlock) => {
+                if !announced && started.elapsed() >= Duration::from_secs(2) {
+                    // Silence during a long wait looks like a hang; name the holder.
+                    match jobs::read_owner(build_dir) {
+                        Some((owner_key, pid, owner_started, args)) => {
+                            let age = jobs::now_epoch().saturating_sub(owner_started);
+                            eprintln!(
+                                "gbb: waiting for build dir: `cargo {args}` (pid {pid}, {age}s old, key {})",
+                                short(&owner_key)
+                            );
+                        }
+                        None => eprintln!("gbb: waiting for build-dir lock {}", path.display()),
+                    }
+                    eprintln!("gbb:   gives up after {}s", timeout.as_secs());
+                    announced = true;
+                }
                 if Instant::now() >= deadline {
                     return Ok(None);
                 }
@@ -449,6 +569,75 @@ fn acquire_build_lock(path: &Path, timeout: Duration) -> io::Result<Option<File>
             Err(std::fs::TryLockError::Error(e)) => return Err(e),
         }
     }
+}
+
+/// Stable id for `--isolated`: an explicit GBB_AGENT wins so several processes
+/// can deliberately share one warm private build dir.
+fn isolated_id(cwd: &Path) -> String {
+    if let Ok(agent) = env::var("GBB_AGENT") {
+        let agent = agent.trim();
+        if !agent.is_empty() {
+            return sanitize(agent);
+        }
+    }
+    format!("w{:08x}", hash_str(&cwd.to_string_lossy()))
+}
+
+fn sanitize(raw: &str) -> String {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let trimmed = cleaned.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "agent".to_string()
+    } else {
+        trimmed.chars().take(40).collect()
+    }
+}
+
+fn hash_str(s: &str) -> u32 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    s.hash(&mut hasher);
+    (hasher.finish() & 0xffff_ffff) as u32
+}
+
+/// Take a private build dir under `<target>/agents/`. A claim lock keeps two
+/// concurrent `--isolated` runs apart while repeated runs stay warm.
+fn claim_isolated(target_root: &Path, base: &str) -> io::Result<Option<(PathBuf, File)>> {
+    let root = target_root.join("agents");
+    std::fs::create_dir_all(&root)?;
+
+    for suffix in 0..8 {
+        let name = if suffix == 0 {
+            base.to_string()
+        } else {
+            format!("{base}-{}", suffix + 1)
+        };
+        let dir = root.join(&name);
+        std::fs::create_dir_all(&dir)?;
+        let claim = dir.join(".gbb-claim.lock");
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(&claim)?;
+        match file.try_lock() {
+            Ok(()) => return Ok(Some((dir, file))),
+            Err(std::fs::TryLockError::WouldBlock) => continue,
+            Err(std::fs::TryLockError::Error(e)) => return Err(e),
+        }
+    }
+    Ok(None)
 }
 
 /// Best-effort detection of a bare `cargo` holding its own build lock.
@@ -557,6 +746,52 @@ fn wait_command(argv: &[String]) -> io::Result<u8> {
             Ok(EXIT_USAGE)
         }
     }
+}
+
+fn cache_command(argv: &[String]) -> io::Result<u8> {
+    let apply = argv.iter().any(|a| a == "--apply");
+    let budget_gb = env_u64("GBB_CACHE_GB", 80);
+    let budget = budget_gb * 1024 * 1024 * 1024;
+    let (removable, removable_bytes) = cache::prune(budget, false)?;
+    let total = cache::total_bytes();
+
+    println!(
+        "cache: {:.1} GB of {budget_gb} GB budget",
+        total as f64 / 1073741824.0
+    );
+    println!();
+    println!(
+        "{:<12} {:<8} {:<18} {:>9} {:>5}",
+        "workspace", "profile", "digest", "size", "age"
+    );
+    for entry in cache::listing() {
+        let age_days = jobs::now_epoch().saturating_sub(entry.created) / 86_400;
+        println!(
+            "{:<12} {:<8} {:<18} {:>6.1} GB {:>4}d",
+            short(&entry.workspace),
+            entry.profile,
+            short(&entry.digest),
+            entry.bytes as f64 / 1073741824.0,
+            age_days
+        );
+    }
+
+    if !apply {
+        println!();
+        println!(
+            "would remove {removable} duplicate/over-budget snapshots ({:.1} GB); add --apply",
+            removable_bytes as f64 / 1073741824.0
+        );
+        return Ok(0);
+    }
+
+    let (removed, bytes) = cache::prune(budget, true)?;
+    println!();
+    println!(
+        "removed {removed} snapshots, freed {:.1} GB",
+        bytes as f64 / 1073741824.0
+    );
+    Ok(0)
 }
 
 fn gc_command(argv: &[String]) -> io::Result<u8> {

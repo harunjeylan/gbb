@@ -19,11 +19,16 @@ pub struct Outcome {
     pub secs: u64,
 }
 
-pub fn run(args: &[String], log: &Path, class: Class) -> io::Result<Outcome> {
+pub fn run(
+    args: &[String],
+    log: &Path,
+    class: Class,
+    target_override: Option<&std::path::Path>,
+) -> io::Result<Outcome> {
     let started = Instant::now();
     let log_file = Arc::new(Mutex::new(open_log(log)?));
 
-    let mut command = build_command(args, class);
+    let mut command = build_command(args, class, target_override);
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -97,7 +102,11 @@ where
 
 /// Cargo, optionally under systemd so a runaway build can never take the
 /// desktop's memory hostage.
-fn build_command(args: &[String], class: Class) -> Command {
+fn build_command(
+    args: &[String],
+    class: Class,
+    target_override: Option<&std::path::Path>,
+) -> Command {
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let systemd = !env_flag("GBB_NO_SYSTEMD") && which("systemd-run").is_some();
     let slice = env::var("GBB_SLICE").unwrap_or_else(|_| "dev.slice".to_string());
@@ -105,6 +114,12 @@ fn build_command(args: &[String], class: Class) -> Command {
     let mut envs: Vec<(String, String)> = Vec::new();
     if let Ok(jobs) = env::var("GBB_JOBS") {
         envs.push(("CARGO_BUILD_JOBS".into(), jobs));
+    }
+    if let Some(dir) = target_override {
+        envs.push((
+            "CARGO_TARGET_DIR".into(),
+            dir.to_string_lossy().into_owned(),
+        ));
     }
     envs.extend(sccache_env());
 

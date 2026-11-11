@@ -22,6 +22,7 @@ that produces two distinct failures:
 | **Dedupe** | An identical command already running in the same build dir is *joined*, not duplicated. Its captured output is replayed to the joiner, including failures. |
 | **Reuse** | A just-finished identical job (same argv + same input digest) is reused for 120 s. Never for `test`/`run`/`bench`: those produce observations, not artifacts. |
 | **Fail fast** | No slot or foreign holder → exit `75` with the holder, its age, ETA from observed durations, and the key to wait on. Agents stop hanging on locks. |
+| **Shared cache** | Cold build dirs are seeded from the newest snapshot of the same repository, across worktrees, so only changed units compile. Snapshots dedupe by artifact set and prune by byte budget. |
 | **Isolation** | Jobs run under `systemd-run --scope --slice=dev.slice`, so a build can never starve the desktop. |
 | **Disk** | `gbb gc` reports the `target/` size of every git worktree and deletes only clean, long-idle ones, and only with `--apply`. |
 
@@ -45,6 +46,8 @@ gbb --wait 300 test -p goldenbee  # block up to 5 min for a slot/lock
 gbb --priority test -p goldenbee  # merge gate: force a heavy slot
 gbb status                        # slots, running jobs, free disk
 gbb doctor                        # resolved build dir, digest time, tool presence
+gbb cache                         # snapshots, size, budget
+gbb cache --apply                 # dedupe + prune to budget
 gbb gc                            # dry run: every worktree's target size
 gbb gc --apply --days 7           # delete clean targets idle ≥ 7 days
 gbb wait <key|prefix>             # join a job another agent started
@@ -62,6 +65,34 @@ through unchanged.
 | `2` | usage error |
 | `75` | busy — retry later or `gbb wait <key>`; nothing was started |
 
+## Build cache
+
+Target dirs are portable: a copied `target/` keeps its fingerprints, so cargo
+recompiles only the units whose inputs changed. `gbb` uses that to make a new
+checkout warm:
+
+1. **Seed** — when a build dir has no profile directory yet (fresh worktree, new
+   `CARGO_TARGET_DIR`, `--isolated`), gbb restores the newest snapshot for the same
+   *repository* (`git rev-parse --git-common-dir`, so all worktrees share a key).
+2. **Build** — cargo decides what is stale. Nothing is trusted blindly; the restored
+   artifacts only save the work cargo would otherwise redo.
+3. **Store** — after a successful artifact-producing command (`build`, `check`,
+   `clippy`, `test --no-run`), the build dir is snapshotted. Skipped when the digest
+   is unchanged, when the dir exceeds `GBB_SNAPSHOT_MAX_GB`, and never for
+   `test`/`run`/`bench` without `--no-run`.
+4. **Dedupe / prune** — snapshots are fingerprinted by artifact paths and sizes
+   (dep-info and `rustc_info` excluded, because they embed absolute paths). Identical
+   snapshots collapse to the newest; over-budget caches drop oldest-first while
+   keeping the newest snapshot of each workspace/profile.
+
+`incremental/` is deliberately excluded: it is machine-local, huge (11 GB in this
+repo), and cargo rebuilds it without losing artifact reuse.
+
+This machine is ext4, so there is no reflink and no copy-on-write: a snapshot is a
+real copy. It is still the cheaper half — 13 GB of deps copies in seconds versus
+10+ minutes of compilation — and the copy cannot corrupt a live build dir because
+seeding only ever fills an empty one.
+
 ## Environment
 
 | variable | default | purpose |
@@ -76,6 +107,10 @@ through unchanged.
 | `GBB_NO_SYSTEMD` | unset | launch cargo directly |
 | `GBB_NO_SCCACHE` | unset | do not inject `RUSTC_WRAPPER=sccache` |
 | `GBB_REUSE_SECS` | `120` | reuse window for finished artifact jobs |
+| `GBB_NO_CACHE` | unset | disable cache seeding and snapshots |
+| `GBB_CACHE_GB` | `80` | snapshot cache budget |
+| `GBB_SNAPSHOT_MAX_GB` | `30` | largest build dir worth snapshotting |
+| `GBB_SNAPSHOT_MIN_SECS` | `300` | min age before re-snapshotting the same digest |
 
 ## Design notes
 

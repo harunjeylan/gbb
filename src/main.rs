@@ -115,10 +115,21 @@ fn install_broken_pipe_guard() {
             .or_else(|| payload.downcast_ref::<&str>().copied())
             .unwrap_or("");
         if message.contains("Broken pipe") {
-            std::process::exit(0);
+            // Unix convention for "killed by SIGPIPE". Exiting 0 would report a
+            // truncated pipeline as success, which is worse than the panic.
+            std::process::exit(141);
         }
         default_hook(info);
     }));
+}
+
+/// Cargo exits 0-255, or dies by signal (reported by the runner as 128+sig).
+/// Anything outside that range must not silently alias success or busy.
+fn exit_code(code: i32) -> u8 {
+    match code {
+        0..=255 => code as u8,
+        _ => EXIT_FAIL,
+    }
 }
 
 fn report(result: io::Result<u8>) -> ExitCode {
@@ -243,19 +254,7 @@ fn run(opts: Opts) -> io::Result<u8> {
         }
     }
 
-    // 2. Global memory-aware slot.
-    let Some(_slot) = slots::acquire(class, opts.wait)? else {
-        return Ok(busy(
-            class,
-            &cmd,
-            &resolved.target,
-            None,
-            "slot",
-            "no free slot; nothing was started",
-        ));
-    };
-
-    // 3. Pick the build directory: private by default, shared with --shared.
+    // 2. Pick the build directory: private by default, shared with --shared.
     let mut build_dir = resolved.target.clone();
     let mut _isolated_claim: Option<File> = None;
     if isolated {
@@ -278,7 +277,7 @@ fn run(opts: Opts) -> io::Result<u8> {
         }
     }
 
-    // 4. One build per build directory, at cargo's own profile granularity.
+    // 3. One build per build directory, at cargo's own profile granularity.
     let profile = profile_of(&opts.cargo_args);
     let lock_path = profile_lock_path(&build_dir, &profile);
     let _lock = match acquire_build_lock(&lock_path, lock_wait, &build_dir)? {
@@ -293,6 +292,19 @@ fn run(opts: Opts) -> io::Result<u8> {
                 "another gbb job owns this build directory and did not finish in time",
             ))
         }
+    };
+
+    // 4. Memory is admitted only once this run is about to consume it. Queueing
+    //    for the build dir must not occupy a slot the whole time.
+    let Some(_slot) = slots::acquire(class, opts.wait)? else {
+        return Ok(busy(
+            class,
+            &cmd,
+            &build_dir,
+            None,
+            "slot",
+            "no free slot; nothing was started",
+        ));
     };
 
     if let Some(foreign) = foreign_cargo_lock(&build_dir) {
@@ -339,7 +351,7 @@ fn run(opts: Opts) -> io::Result<u8> {
                     job.exit
                 );
                 replay(&key);
-                return Ok(job.exit as u8);
+                return Ok(exit_code(job.exit));
             }
         }
     }
@@ -376,7 +388,7 @@ fn run(opts: Opts) -> io::Result<u8> {
         outcome.secs, outcome.exit, digest_ms
     );
 
-    Ok(outcome.exit as u8)
+    Ok(exit_code(outcome.exit))
 }
 
 fn busy(
@@ -471,7 +483,7 @@ fn wait_for_job(key: &str, timeout: Duration) -> io::Result<u8> {
         match jobs::read(key) {
             Some(job) if job.state == jobs::State::Done => {
                 replay(key);
-                return Ok(job.exit as u8);
+                return Ok(exit_code(job.exit));
             }
             Some(job) if !job.is_live() => {
                 eprintln!("gbb: job {} died without recording a result", short(key));
@@ -920,4 +932,36 @@ fn trim(s: &str, max: usize) -> String {
     }
     let keep: String = s.chars().take(max.saturating_sub(1)).collect();
     format!("{keep}…")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exit_codes_outside_u8_do_not_alias_success_or_busy() {
+        assert_eq!(exit_code(0), 0);
+        assert_eq!(exit_code(101), 101);
+        assert_eq!(exit_code(255), 255);
+        assert_eq!(exit_code(256), EXIT_FAIL);
+        assert_eq!(exit_code(331), EXIT_FAIL);
+        assert_eq!(exit_code(-1), EXIT_FAIL);
+    }
+
+    #[test]
+    fn profile_detection_reads_release_and_custom_profiles() {
+        let args = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(profile_of(&args(&["test"])), "dev");
+        assert_eq!(profile_of(&args(&["build", "--release"])), "release");
+        assert_eq!(profile_of(&args(&["build", "-r"])), "release");
+        assert_eq!(profile_of(&args(&["build", "--profile", "bench"])), "bench");
+        assert_eq!(profile_of(&args(&["build", "--profile=fast"])), "fast");
+    }
+
+    #[test]
+    fn sanitize_keeps_identifiers_bounded() {
+        assert_eq!(sanitize("agent/one two"), "agent-one-two");
+        assert_eq!(sanitize("///"), "agent");
+        assert_eq!(sanitize(&"x".repeat(80)).len(), 40);
+    }
 }

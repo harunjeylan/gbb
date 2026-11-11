@@ -55,10 +55,10 @@ runtime and their absence only removes isolation/caching, never correctness.
 ## Usage
 
 ```sh
-gbb check -p goldenbee            # light slot, private build dir
-gbb test -p goldenbee filter      # heavy slot, private build dir
-gbb --shared test -p goldenbee    # one shared dir: join or wait instead
-gbb --wait 300 test -p goldenbee  # block up to 5 min for a slot
+gbb check -p my-crate             # light slot, private build dir
+gbb test -p my-crate filter       # heavy slot, private build dir
+gbb --shared test -p my-crate     # one shared dir: join or wait instead
+gbb --wait 300 test -p my-crate   # block up to 5 min for a slot
 gbb status                        # slots, running jobs, free disk
 gbb doctor                        # resolved build dir, digest time, tool presence
 gbb cache                         # snapshots, size, budget

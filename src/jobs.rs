@@ -536,7 +536,7 @@ mod tests {
             exit: 1,
             class: "heavy".into(),
             target: "/tmp/x/target".into(),
-            args: vec!["test".into(), "-p".into(), "goldenbee".into(), "a b".into()],
+            args: vec!["test".into(), "-p".into(), "my-crate".into(), "a b".into()],
             child_pid: 43,
         };
         let text = format!(

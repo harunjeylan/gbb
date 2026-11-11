@@ -69,15 +69,15 @@ mod tests {
 
     #[test]
     fn check_is_light() {
-        assert_eq!(classify(&v(&["check", "-p", "goldenbee"])), Class::Light);
+        assert_eq!(classify(&v(&["check", "-p", "my-crate"])), Class::Light);
         assert_eq!(classify(&v(&["clippy", "--all-targets"])), Class::Light);
     }
 
     #[test]
     fn test_and_build_are_heavy() {
-        assert_eq!(classify(&v(&["test", "-p", "goldenbee"])), Class::Heavy);
+        assert_eq!(classify(&v(&["test", "-p", "my-crate"])), Class::Heavy);
         assert_eq!(classify(&v(&["build"])), Class::Heavy);
-        assert_eq!(classify(&v(&["run", "--bin", "goldenbee"])), Class::Heavy);
+        assert_eq!(classify(&v(&["run", "--bin", "my-crate"])), Class::Heavy);
     }
 
     #[test]

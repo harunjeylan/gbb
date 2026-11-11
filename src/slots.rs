@@ -36,7 +36,7 @@ fn open(path: &PathBuf) -> io::Result<File> {
         .open(path)
 }
 
-/// One goldenbee-style link peaks around 5-6 GB. Admission is therefore limited
+/// A large final link can peak around 5-6 GB. Admission is therefore limited
 /// by actual available memory, not only by the configured slot count, so the box
 /// does not swap itself to death when several builds start together.
 fn job_memory_bytes(settings: &Settings) -> u64 {

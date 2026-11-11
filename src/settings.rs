@@ -33,6 +33,13 @@ pub struct Settings {
     pub slice: String,
     pub jobs: Option<String>,
     pub no_sccache: bool,
+
+    /// Health sampler interval and reporting thresholds.
+    pub sample_secs: u64,
+    pub notice_secs: u64,
+    pub slow_factor_pct: u64,
+    pub stall_cpu_pct: u64,
+    pub swap_warn_gb: u64,
 }
 
 impl Default for Settings {
@@ -62,6 +69,12 @@ impl Default for Settings {
             slice: "dev.slice".to_string(),
             jobs: None,
             no_sccache: false,
+
+            sample_secs: 5,
+            notice_secs: 30,
+            slow_factor_pct: 200,
+            stall_cpu_pct: 2,
+            swap_warn_gb: 4,
         }
     }
 }
@@ -98,6 +111,12 @@ impl Settings {
             slice: env::var("GBB_SLICE").unwrap_or(default.slice),
             jobs: env::var("GBB_JOBS").ok().filter(|v| !v.is_empty()),
             no_sccache: env_flag("GBB_NO_SCCACHE"),
+
+            sample_secs: env_u64("GBB_SAMPLE_SECS", default.sample_secs).max(1),
+            notice_secs: env_u64("GBB_NOTICE_SECS", default.notice_secs).max(5),
+            slow_factor_pct: env_u64("GBB_SLOW_FACTOR_PCT", default.slow_factor_pct).max(110),
+            stall_cpu_pct: env_u64("GBB_STALL_CPU_PCT", default.stall_cpu_pct),
+            swap_warn_gb: env_u64("GBB_SWAP_WARN_GB", default.swap_warn_gb),
         }
     }
 }

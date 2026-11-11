@@ -24,6 +24,7 @@ that produces two distinct failures:
 | **Dedupe** | An identical command already running in the same build dir is *joined*, not duplicated. Its captured output is replayed to the joiner, including failures. |
 | **Reuse** | A just-finished identical job (same argv + same input digest) is reused for 120 s. Never for `test`/`run`/`bench`: those produce observations, not artifacts. |
 | **Fail fast** | No slot or foreign holder → exit `75` with the holder, its age, ETA from observed durations, and the key to wait on. Agents stop hanging on locks. |
+| **Health** | While a job runs, a sampler compares it to a learned p90 for the same command *and* concurrency level, and surfaces `SLOW`, `STALLED` or `THRASHING` on stderr and in `gbb status`. `gbb kill <key>` stops it. |
 | **Shared cache** | Cold build dirs are seeded from the newest snapshot of the same repository, across worktrees, so only changed units compile. Snapshots dedupe by artifact set and prune by byte budget. |
 | **Isolation** | Jobs run under `systemd-run --scope --slice=dev.slice`, so a build can never starve the desktop. |
 | **Disk** | `gbb gc` reports the `target/` size of every git worktree and deletes only clean, long-idle ones, and only with `--apply`. |
@@ -53,6 +54,8 @@ gbb cache --apply                 # dedupe + prune to budget
 gbb gc                            # dry run: every worktree's target size
 gbb gc --apply --days 7           # delete clean targets idle ≥ 7 days
 gbb wait <key|prefix>             # join a job another agent started
+gbb kill <key|prefix>             # stop one job, by systemd scope or child pid
+gbb kill --all-slow               # stop every job currently reporting abnormality
 ```
 
 `gbb` accepts the same arguments as cargo; anything it does not recognise is passed
@@ -120,6 +123,11 @@ dir is inline, because it is still cheaper than the rebuild it replaces.
 | `GBB_SNAPSHOT_MAX_GB` | `30` | largest build dir worth snapshotting |
 | `GBB_SNAPSHOT_MIN_SECS` | `300` | min age before re-snapshotting the same digest |
 | `GBB_STORE_FORCE` | unset | snapshot even while other jobs are running |
+| `GBB_SAMPLE_SECS` | `5` | health sampling interval |
+| `GBB_NOTICE_SECS` | `30` | minimum gap between abnormal notices |
+| `GBB_SLOW_FACTOR_PCT` | `200` | elapsed/p90 ratio that counts as slow |
+| `GBB_STALL_CPU_PCT` | `2` | CPU below this with no `rustc` child counts as stalled |
+| `GBB_SWAP_WARN_GB` | `4` | system swap that turns slow into thrashing |
 
 ## Design notes
 
@@ -148,6 +156,13 @@ dir is inline, because it is still cheaper than the rebuild it replaces.
   through `gbb`.
 - **`test`/`run`/`bench` are never reused**, even with an identical digest: a green
   result from two minutes ago is not evidence about the code now.
+- **Health is a baseline, not a timeout.** A command has no single duration: four
+  concurrent builds are slower than one. Samples are bucketed at 1, 2 and 3+ heavy
+  jobs, and a run is only abnormal relative to its bucket (falling back to the
+  all-bucket distribution until that bucket has two samples). A job with no
+  baseline is never called slow. The sampler reads one `/proc/<pid>/stat` per
+  process, writes health atomically, and only reports `stalled` after a 30 s grace
+  period so dependency resolution is not mistaken for a hang.
 
 ## Prior art
 

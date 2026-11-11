@@ -34,7 +34,7 @@ gbb — cargo build broker for parallel agents
 
 USAGE
   gbb [options] <cargo args...>
-  gbb status | doctor | cache | gc | wait <key> | help | version
+  gbb status | doctor | cache | gc | kill | wait <key> | help | version
 
 OPTIONS (before the cargo subcommand)
   --wait <secs>    block up to this long for a slot/lock (default 0 = fail fast)
@@ -48,10 +48,16 @@ OPTIONS (before the cargo subcommand)
 EXIT CODES
   0 ok · 1 build/test failure · 2 usage · 75 busy (retry later or `gbb wait <key>`)
 
+HEALTH
+  While a job runs, gbb compares it to a learned p90 for that command at the same
+  level of concurrency and reports SLOW, STALLED or THRASHING on stderr and in
+  `gbb status`. `gbb kill <key>` stops the job; `gbb kill --all-slow` stops every
+  job currently reporting an abnormal state.
+
 ENV
   GBB_WAIT            default for --wait
-  GBB_LIGHT_SLOTS     concurrent light jobs (default 4)
-  GBB_HEAVY_SLOTS     concurrent heavy jobs (default 2)
+  GBB_LIGHT_SLOTS     concurrent light jobs (default 6)
+  GBB_HEAVY_SLOTS     concurrent heavy jobs (default 3)
   GBB_JOBS            CARGO_BUILD_JOBS for launched jobs
   GBB_SLICE           systemd slice (default dev.slice)
   GBB_NO_SYSTEMD      launch cargo directly instead of under systemd-run
@@ -62,6 +68,11 @@ ENV
   GBB_CACHE_GB        cache byte budget (default 80)
   GBB_SNAPSHOT_MAX_GB largest build dir worth snapshotting (default 30)
   GBB_SNAPSHOT_MIN_SECS minimum age before an identical digest is re-snapshotted (default 300)
+  GBB_SAMPLE_SECS     health sampling interval (default 5)
+  GBB_NOTICE_SECS     minimum gap between abnormal notices (default 30)
+  GBB_SLOW_FACTOR_PCT elapsed/p90 ratio that counts as slow (default 200)
+  GBB_STALL_CPU_PCT   cpu below this with no rustc child is stalled (default 2)
+  GBB_SWAP_WARN_GB    system swap that turns slow into thrashing (default 4)
 ";
 
 struct Opts {
@@ -93,6 +104,7 @@ fn main() -> ExitCode {
         "doctor" => report(doctor(&Settings::load())),
         "gc" => report(gc_command(&argv[1..])),
         "cache" => report(cache_command(&argv[1..], &Settings::load())),
+        "kill" => report(kill_command(&argv[1..])),
         "wait" => report(wait_command(&argv[1..])),
         _ => {
             let settings = Settings::load();
@@ -268,7 +280,6 @@ fn run(opts: Opts, settings: &Settings) -> io::Result<u8> {
                     class,
                     &cmd,
                     &resolved.target,
-                    None,
                     "isolated",
                     "every isolated build dir for this agent id is busy",
                     settings,
@@ -287,7 +298,6 @@ fn run(opts: Opts, settings: &Settings) -> io::Result<u8> {
                 class,
                 &cmd,
                 &build_dir,
-                None,
                 "build-dir",
                 "another gbb job owns this build directory and did not finish in time",
                 settings,
@@ -302,7 +312,6 @@ fn run(opts: Opts, settings: &Settings) -> io::Result<u8> {
             class,
             &cmd,
             &build_dir,
-            None,
             "slot",
             "no free slot; nothing was started",
             settings,
@@ -320,12 +329,16 @@ fn run(opts: Opts, settings: &Settings) -> io::Result<u8> {
     // 5. A cold build dir is seeded from the newest shared snapshot, so cargo
     //    recompiles only what changed instead of everything.
     let workspace = cache::workspace_key(&resolved.root);
+    let mut seeded = false;
     if cache::is_cold(&build_dir, &profile) {
         match cache::seed(&build_dir, &workspace, &profile, settings) {
-            Ok(Some(seed_digest)) => eprintln!(
-                "gbb: cold build dir seeded from cache (digest {})",
-                short(&seed_digest)
-            ),
+            Ok(Some(seed_digest)) => {
+                seeded = true;
+                eprintln!(
+                    "gbb: cold build dir seeded from cache (digest {})",
+                    short(&seed_digest)
+                );
+            }
             Ok(None) => {}
             Err(e) => eprintln!("gbb: cache seed skipped: {e}"),
         }
@@ -355,9 +368,17 @@ fn run(opts: Opts, settings: &Settings) -> io::Result<u8> {
         }
     }
 
-    // 8. Build.
-    jobs::prune_logs(24 * 60 * 60);
+    // 8. Build. The baseline is bucketed by how many heavy jobs are already
+    //    running: a p90 measured alone is a lie under contention.
+    jobs::prune_state(24 * 60 * 60, 7 * 24 * 60 * 60);
     let log = jobs::log_path(&key);
+    let bucket = jobs::running_jobs()
+        .iter()
+        .filter(|job| job.class == "heavy" && job.pid != std::process::id())
+        .count()
+        .clamp(1, 3) as u8;
+    let baseline = jobs::baseline(class.as_str(), &cmd, bucket);
+
     let mut job = jobs::Job::started_running(
         &key,
         std::process::id(),
@@ -369,12 +390,27 @@ fn run(opts: Opts, settings: &Settings) -> io::Result<u8> {
     let _ = jobs::write_owner(&build_dir, &job);
 
     let target_override = isolated.then_some(build_dir.as_path());
-    let outcome = runner::run(&opts.cargo_args, &log, class, target_override, settings)?;
+    let running = runner::start(
+        &opts.cargo_args,
+        &log,
+        class,
+        target_override,
+        settings,
+        &key,
+        baseline,
+    )?;
+
+    // Recorded before waiting, so `gbb kill` can reach the work in progress.
+    job.child_pid = running.pid();
+    jobs::write(&job)?;
+
+    let outcome = running.wait()?;
 
     job.finish(outcome.exit);
     jobs::write(&job)?;
     jobs::clear_owner(&build_dir);
-    jobs::record_duration(class.as_str(), &cmd, outcome.secs);
+    jobs::clear_health(&key);
+    jobs::record_duration(class.as_str(), &cmd, bucket, outcome.secs);
 
     // 9. Refresh the shared cache so the next cold checkout starts warm.
     //    Copies take minutes on a loaded disk, so this is a detached child.
@@ -382,9 +418,22 @@ fn run(opts: Opts, settings: &Settings) -> io::Result<u8> {
         cache::spawn_store(&build_dir, &workspace, &profile, &digest, settings);
     }
 
+    let expected = if baseline.p90 > 0 {
+        format!(
+            ", {:.1}x p90 {}",
+            outcome.secs as f64 / baseline.p90.max(1) as f64,
+            runner::human(baseline.p90)
+        )
+    } else {
+        String::new()
+    };
+    let seeded = if seeded { ", seeded" } else { "" };
     eprintln!(
-        "gbb: {class} {cmd} finished in {}s (exit {}, digest {}ms)",
-        outcome.secs, outcome.exit, digest_ms
+        "gbb: {class} {cmd} finished in {}s{expected}{seeded} (exit {}, key {}, digest {}ms)",
+        outcome.secs,
+        outcome.exit,
+        short(&key),
+        digest_ms
     );
 
     Ok(exit_code(outcome.exit))
@@ -394,7 +443,6 @@ fn busy(
     class: Class,
     cmd: &str,
     target: &Path,
-    key: Option<&str>,
     reason: &str,
     detail: &str,
     settings: &Settings,
@@ -417,12 +465,8 @@ fn busy(
     }
 
     // Point the agent at a job it can actually wait on.
-    let wait_key = key
-        .map(|k| k.to_string())
-        .or_else(|| owner.map(|(k, _, _, _)| k));
-
-    match wait_key {
-        Some(wait_key) => {
+    match owner {
+        Some((wait_key, _, _, _)) => {
             println!("GBB_BUSY reason={reason} key={wait_key} slot={class}{eta}");
             println!(
                 "  → do not retry more than 3x, do not run bare cargo, work on something else,"
@@ -463,7 +507,22 @@ fn wait_for_job(key: &str, timeout: Duration) -> io::Result<u8> {
         let elapsed = started.elapsed().as_secs();
         if elapsed >= 10 && elapsed / 10 > announced {
             announced = elapsed / 10;
-            eprintln!("gbb: still waiting for job {} ({elapsed}s)", short(key));
+            match jobs::read_health(key) {
+                Some(health) => eprintln!(
+                    "gbb: waiting {}s for job {} — {} ({}% cpu, {} MB rss, swap {} GB)",
+                    elapsed,
+                    short(key),
+                    health.state,
+                    health.cpu_pct,
+                    health.rss_mb,
+                    health.swap_gb
+                ),
+                None => eprintln!(
+                    "gbb: waiting {}s for job {} (no health sample yet)",
+                    elapsed,
+                    short(key)
+                ),
+            }
         }
         match jobs::read(key) {
             Some(job) if job.state == jobs::State::Done => {
@@ -681,13 +740,46 @@ fn status(settings: &Settings) -> io::Result<u8> {
     if running.is_empty() {
         println!("no gbb jobs running");
     } else {
-        println!("{:<14} {:<6} {:>7}  args", "key", "class", "age");
+        println!(
+            "{:<14} {:<6} {:>5} {:<10} {:>5} {:>7} {:>6} {:>7}  args",
+            "key", "class", "age", "state", "cpu", "rss", "swap", "p90"
+        );
         for job in running {
+            let health = jobs::read_health(&job.key);
+            let (state, cpu, rss, swap, p90) = match &health {
+                Some(health) => (
+                    if health.state == "running" {
+                        "running".to_string()
+                    } else {
+                        health.state.to_uppercase()
+                    },
+                    format!("{}%", health.cpu_pct),
+                    format!("{}M", health.rss_mb),
+                    format!("{}G", health.swap_gb),
+                    if health.p90 > 0 {
+                        runner::human(health.p90)
+                    } else {
+                        "-".to_string()
+                    },
+                ),
+                None => (
+                    "starting".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                    "-".to_string(),
+                ),
+            };
             println!(
-                "{:<14} {:<6} {:>6}s  cargo {}",
+                "{:<14} {:<6} {:>4}s {:<10} {:>5} {:>7} {:>6} {:>7}  cargo {}",
                 short(&job.key),
                 job.class,
                 job.age_secs(),
+                state,
+                cpu,
+                rss,
+                swap,
+                p90,
                 job.args.join(" ")
             );
         }
@@ -711,12 +803,10 @@ fn doctor(settings: &Settings) -> io::Result<u8> {
     );
     println!("runtime dir    : {}", jobs::runtime_dir().display());
     println!("cache dir      : {}", jobs::cache_dir().display());
+    let (light_used, light_total) = slots::occupancy(Class::Light, settings);
+    let (heavy_used, heavy_total) = slots::occupancy(Class::Heavy, settings);
     println!(
-        "slots          : light {}/{} · heavy {}/{}",
-        slots::occupancy(Class::Light, settings).0,
-        slots::occupancy(Class::Light, settings).1,
-        slots::occupancy(Class::Heavy, settings).0,
-        slots::occupancy(Class::Heavy, settings).1
+        "slots          : light {light_used}/{light_total} · heavy {heavy_used}/{heavy_total}"
     );
     for bin in ["cargo", "systemd-run", "sccache", "mold", "ld.mold"] {
         println!(
@@ -754,6 +844,101 @@ fn wait_command(argv: &[String]) -> io::Result<u8> {
             Ok(EXIT_USAGE)
         }
     }
+}
+
+/// Stop a job that is running abnormally, by key prefix or all abnormal jobs.
+fn kill_command(argv: &[String]) -> io::Result<u8> {
+    let all_slow = argv.iter().any(|arg| arg == "--all-slow");
+    let running = jobs::running_jobs();
+
+    let targets: Vec<jobs::Job> = if all_slow {
+        running
+            .into_iter()
+            .filter(|job| {
+                jobs::read_health(&job.key)
+                    .map(|health| health.state != "running")
+                    .unwrap_or(false)
+            })
+            .collect()
+    } else {
+        let Some(prefix) = argv.first().filter(|arg| !arg.starts_with('-')) else {
+            eprintln!("gbb: usage: gbb kill <key|prefix> | gbb kill --all-slow");
+            return Ok(EXIT_USAGE);
+        };
+        let matches: Vec<jobs::Job> = running
+            .into_iter()
+            .filter(|job| job.key.starts_with(prefix))
+            .collect();
+        match matches.len() {
+            0 => {
+                eprintln!("gbb: no running job matches {prefix}");
+                return Ok(EXIT_FAIL);
+            }
+            1 => matches,
+            _ => {
+                eprintln!("gbb: prefix {prefix} is ambiguous:");
+                for job in &matches {
+                    eprintln!("  {}  cargo {}", job.key, job.args.join(" "));
+                }
+                return Ok(EXIT_USAGE);
+            }
+        }
+    };
+
+    if targets.is_empty() {
+        println!("gbb: nothing to stop");
+        return Ok(0);
+    }
+    stop_jobs(&targets);
+    Ok(0)
+}
+
+/// Stop every target first, then give all TERMed children the same grace
+/// period. Sleeping per job would make `--all-slow` take seconds per victim.
+fn stop_jobs(targets: &[jobs::Job]) {
+    let mut stopped: Vec<(&jobs::Job, &'static str)> = Vec::with_capacity(targets.len());
+    for job in targets {
+        let unit = format!("gbb-{}.scope", short(&job.key));
+        let by_unit = std::process::Command::new("systemctl")
+            .args(["--user", "stop", &unit])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if by_unit {
+            stopped.push((job, "systemd scope"));
+        } else if job.child_pid > 0 {
+            signal("TERM", job.child_pid);
+            stopped.push((job, "child process"));
+        } else {
+            stopped.push((job, "no reachable process"));
+        }
+    }
+
+    if stopped.iter().any(|(_, how)| *how == "child process") {
+        std::thread::sleep(Duration::from_secs(2));
+        for (job, how) in &stopped {
+            if *how == "child process" && jobs::pid_alive(job.child_pid) {
+                signal("KILL", job.child_pid);
+            }
+        }
+    }
+
+    for (job, how) in stopped {
+        let state = jobs::read_health(&job.key)
+            .map(|health| health.state)
+            .unwrap_or_else(|| "running".to_string());
+        println!(
+            "gbb: stopped {} ({state}, `cargo {}`) via {how}",
+            short(&job.key),
+            job.args.join(" ")
+        );
+    }
+}
+
+fn signal(signal: &str, pid: u32) {
+    let _ = std::process::Command::new("kill")
+        .args([format!("-{signal}"), pid.to_string()])
+        .output();
 }
 
 fn cache_command(argv: &[String], settings: &Settings) -> io::Result<u8> {

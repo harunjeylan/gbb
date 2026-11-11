@@ -1,0 +1,13 @@
+[package]
+name = "gbb"
+version = "0.1.0"
+edition = "2021"
+description = "Cargo build broker: per-target-dir locks, memory-aware slots, and job dedupe so parallel agents never block each other"
+license = "MIT"
+
+[dependencies]
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true
